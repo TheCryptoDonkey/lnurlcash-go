@@ -1,0 +1,372 @@
+package lnurlcash
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+)
+
+// Client performs the GETs. It is deliberately thin: everything about the
+// protocol lives in the Request/Parse pairs above, and this only classifies a
+// failure by whether the request could have been processed.
+//
+// A caller with its own HTTP stack should use those directly and skip this.
+type Client struct {
+	// HTTP performs the requests.
+	//
+	// A replacement MUST NOT retry. See NewClient for why, at length: it is the
+	// sharpest edge in this package, and it is not obvious.
+	HTTP *http.Client
+
+	// Timeout bounds every request. Without one a hung service blocks forever.
+	Timeout time.Duration
+
+	// Offline refuses to make any request at all. For a caller that wants
+	// certainty nothing reaches the network, rather than trusting that it
+	// happens not to.
+	Offline bool
+
+	// Secrets supplies replacement note secrets. Nil means the OS CSPRNG.
+	Secrets SecretSource
+}
+
+// NewClient returns a Client whose HTTP transport will not silently retry.
+//
+// This is the most important thing in this file, and it is worth saying why in
+// full.
+//
+// Every LNURLcash mutation - rotate, split, merge, melt - is an HTTP GET. HTTP
+// considers GET idempotent, so a transport may resend one when a connection
+// fails mid-flight. An LNURLcash mutation is emphatically not idempotent: the
+// first attempt burns the input note.
+//
+// So when a service applies a rotate and the connection then drops, a retrying
+// transport sends it again, gets "invalid or already spent k1" for the second
+// attempt, and the caller sees a definitive rejection. It concludes nothing
+// happened and discards the fresh secret - which was the only copy of the note
+// the service just minted. The money is gone, and every layer behaved
+// reasonably.
+//
+// Go's net/http does exactly this, under a condition that is easy to miss: it
+// retries an idempotent request when it was sent on a REUSED connection. A
+// client with no Transport of its own uses http.DefaultTransport, whose
+// connection pool is shared process-wide - so whether a mutation is silently
+// retried depends on whether some unrelated code happened to talk to the same
+// host first. That is not a property to leave to chance with somebody's money.
+//
+// Disabling keep-alives removes the only condition under which net/http
+// retries. The cost is a fresh connection per request, which for a wallet
+// making a handful of them is not a cost worth weighing against this.
+func NewClient() *Client {
+	return &Client{
+		HTTP: &http.Client{
+			Transport: &http.Transport{
+				DisableKeepAlives: true,
+				Proxy:             http.ProxyFromEnvironment,
+			},
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		Timeout: 30 * time.Second,
+	}
+}
+
+func (c *Client) secret() (string, error) {
+	if c.Secrets != nil {
+		return c.Secrets()
+	}
+	return GenerateNoteSecret()
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	// Never http.DefaultClient: its transport pools connections process-wide,
+	// which is the condition under which net/http silently retries a mutation.
+	// A zero-value Client gets the same safe transport NewClient builds.
+	return NewClient().HTTP
+}
+
+func (c *Client) timeout() time.Duration {
+	if c.Timeout > 0 {
+		return c.Timeout
+	}
+	return 30 * time.Second
+}
+
+// do performs one request, classifying every failure by whether the service
+// could have processed it.
+func (c *Client) do(ctx context.Context, request Request) ([]byte, error) {
+	attach := func(err error) error {
+		var ambiguous *AmbiguousError
+		if asAmbiguous(err, &ambiguous) {
+			ambiguous.NewSecrets = request.NewSecrets
+		}
+		return err
+	}
+
+	if c.Offline {
+		return nil, fmt.Errorf("%w: offline mode is on - no request was made", ErrRequestRefused)
+	}
+	if !IsAllowedServiceURL(request.URL) {
+		return nil, fmt.Errorf(
+			"%w: refusing to fetch that URL - only https, or http to a loopback or .onion host, is allowed",
+			ErrRequestRefused,
+		)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, c.timeout())
+	defer cancel()
+
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, request.URL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrRequestRefused, err)
+	}
+	response, err := c.httpClient().Do(httpRequest)
+	if err != nil {
+		// Transport failures are ambiguous for a mutating request: the request
+		// may well have arrived, and only the answer was lost.
+		return nil, attach(&AmbiguousError{
+			Detail: "failed to reach the service, or its answer was lost - the request may still have been processed",
+			Cause:  err,
+		})
+	}
+	defer response.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return nil, attach(&AmbiguousError{
+			Detail: "the service's response could not be read",
+			Cause:  err,
+		})
+	}
+	return body, nil
+}
+
+// FetchNoteInfo performs the informational GET. It never burns the note.
+func (c *Client) FetchNoteInfo(ctx context.Context, noteURL string) (WithdrawInfo, error) {
+	request, err := NoteInfoRequest(noteURL)
+	if err != nil {
+		return WithdrawInfo{}, err
+	}
+	body, err := c.do(ctx, request)
+	if err != nil {
+		return WithdrawInfo{}, err
+	}
+	return ParseNoteInfo(body, noteURL)
+}
+
+// FetchMintAddress performs the experimental mint-address GET.
+func (c *Client) FetchMintAddress(ctx context.Context, rawURL string) (MintAddress, error) {
+	request, err := MintAddressRequest(rawURL)
+	if err != nil {
+		return MintAddress{}, err
+	}
+	body, err := c.do(ctx, request)
+	if err != nil {
+		return MintAddress{}, err
+	}
+	return ParseMintAddress(body)
+}
+
+func (c *Client) mutate(ctx context.Context, request Request, err error) (Mutation, error) {
+	if err != nil {
+		return Mutation{}, err
+	}
+	body, err := c.do(ctx, request)
+	if err != nil {
+		return Mutation{}, err
+	}
+	return ParseMutation(body, request.NewSecrets)
+}
+
+// MeltNote burns a note; the service pays pr of exactly its value.
+//
+// Success means the payment is IN FLIGHT, not that the note is spent.
+func (c *Client) MeltNote(ctx context.Context, callback, k1, pr string) (Mutation, error) {
+	request, err := MeltRequest(callback, k1, pr)
+	return c.mutate(ctx, request, err)
+}
+
+// RotatedNote is a note this wallet now holds, whose secret the service has
+// never seen.
+type RotatedNote struct {
+	K1        string
+	Signature string
+}
+
+// SplitNotes are the two notes a split produced.
+type SplitNotes struct {
+	K1              string
+	Change          string
+	Signature       string
+	ChangeSignature string
+}
+
+// RotateNote burns k1 and mints a fresh secret of the same value, which this
+// wallet generates and the service never sees.
+//
+// On an ambiguous failure the fresh secret rides the error - see NewSecrets.
+func (c *Client) RotateNote(ctx context.Context, callback, k1 string) (RotatedNote, error) {
+	fresh, err := c.secret()
+	if err != nil {
+		return RotatedNote{}, err
+	}
+	request, err := RotateRequest(callback, k1, fresh)
+	mutation, err := c.mutate(ctx, request, err)
+	if err != nil {
+		return RotatedNote{}, err
+	}
+	return RotatedNote{K1: fresh, Signature: mutation.Signature}, nil
+}
+
+// SplitNote burns one or many notes, minting one worth amountMsat and one
+// carrying the remainder.
+func (c *Client) SplitNote(ctx context.Context, callback string, k1s []string, amountMsat int64) (SplitNotes, error) {
+	fresh, err := c.secret()
+	if err != nil {
+		return SplitNotes{}, err
+	}
+	change, err := c.secret()
+	if err != nil {
+		return SplitNotes{}, err
+	}
+	request, err := SplitRequest(callback, k1s, amountMsat, fresh, change)
+	mutation, err := c.mutate(ctx, request, err)
+	if err != nil {
+		return SplitNotes{}, err
+	}
+	return SplitNotes{
+		K1:              fresh,
+		Change:          change,
+		Signature:       mutation.Signature,
+		ChangeSignature: mutation.ChangeSignature,
+	}, nil
+}
+
+// MergeNotes burns all the given notes and mints one worth their sum.
+func (c *Client) MergeNotes(ctx context.Context, callback string, k1s []string) (RotatedNote, error) {
+	fresh, err := c.secret()
+	if err != nil {
+		return RotatedNote{}, err
+	}
+	request, err := MergeRequest(callback, k1s, fresh)
+	mutation, err := c.mutate(ctx, request, err)
+	if err != nil {
+		return RotatedNote{}, err
+	}
+	return RotatedNote{K1: fresh, Signature: mutation.Signature}, nil
+}
+
+// FetchPayRequest reads a mint's payRequest.
+func (c *Client) FetchPayRequest(ctx context.Context, rawURL string) (PayRequest, error) {
+	request, err := PayRequestRequest(rawURL)
+	if err != nil {
+		return PayRequest{}, err
+	}
+	body, err := c.do(ctx, request)
+	if err != nil {
+		return PayRequest{}, err
+	}
+	return ParsePayRequest(body)
+}
+
+// RequestInvoice asks a mint for an invoice whose preimage will become a note.
+func (c *Client) RequestInvoice(ctx context.Context, payCallback string, amountMsat int64) (Invoice, error) {
+	request, err := InvoiceRequest(payCallback, amountMsat)
+	if err != nil {
+		return Invoice{}, err
+	}
+	body, err := c.do(ctx, request)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return ParseInvoice(body, amountMsat)
+}
+
+// FetchInvoiceStatus polls a LUD-21 verify URL.
+func (c *Client) FetchInvoiceStatus(ctx context.Context, verifyURL string) (InvoiceStatus, error) {
+	request, err := VerifyRequest(verifyURL)
+	if err != nil {
+		return InvoiceStatus{}, err
+	}
+	body, err := c.do(ctx, request)
+	if err != nil {
+		return InvoiceStatus{}, err
+	}
+	return ParseVerify(body)
+}
+
+// NoteFate is what a probe learned about a note whose fate was uncertain.
+type NoteFate string
+
+const (
+	// NoteLive means the request never landed, so the fresh secrets minted
+	// nothing and can be discarded.
+	NoteLive NoteFate = "live"
+	// NoteGone means the burn landed, and the carried secrets are the only money
+	// left.
+	NoteGone NoteFate = "gone"
+	// NoteFateUnknown means the probe itself failed. No information either way -
+	// keep everything.
+	NoteFateUnknown NoteFate = "unknown"
+)
+
+// ProbeBurnedNote answers, after an ambiguous mutation, whether the burn
+// actually happened.
+func (c *Client) ProbeBurnedNote(ctx context.Context, noteURL string) NoteFate {
+	_, err := c.FetchNoteInfo(ctx, noteURL)
+	switch {
+	case err == nil:
+		return NoteLive
+	case IsSpent(err), IsUnknownNote(err):
+		return NoteGone
+	default:
+		return NoteFateUnknown
+	}
+}
+
+// SettledNote is a note resolved against what the service says it is worth.
+type SettledNote struct {
+	K1         string
+	AmountMsat int64
+	Signature  string
+	Callback   string
+}
+
+// SettleNote resolves what a split's change or a merge's output is ACTUALLY
+// worth, then rotates it before further use.
+//
+// Neither response carries an amount - the spec's only source of truth is an
+// informational GET - and a fee-charging service may have deducted from a
+// split's change or refunded into a merge's result. That GET puts k1 on the
+// wire, so a rotate follows, best-effort.
+func (c *Client) SettleNote(ctx context.Context, baseURL, k1 string, expectedAmountMsat int64, signature string) (SettledNote, error) {
+	noteURL := WithNewK1(baseURL, k1, expectedAmountMsat, signature)
+	if noteURL == "" {
+		return SettledNote{}, fmt.Errorf("%w: that note URL does not parse", ErrRequestRefused)
+	}
+	info, err := c.FetchNoteInfo(ctx, noteURL)
+	if err != nil {
+		return SettledNote{}, err
+	}
+	rotated, err := c.RotateNote(ctx, info.Callback, k1)
+	if err != nil {
+		return SettledNote{
+			K1:         k1,
+			AmountMsat: info.MaxWithdrawableMsat,
+			Signature:  signature,
+			Callback:   info.Callback,
+		}, nil
+	}
+	return SettledNote{
+		K1:         rotated.K1,
+		AmountMsat: info.MaxWithdrawableMsat,
+		Signature:  rotated.Signature,
+		Callback:   info.Callback,
+	}, nil
+}

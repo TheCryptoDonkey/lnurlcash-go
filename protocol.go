@@ -1,0 +1,517 @@
+package lnurlcash
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+)
+
+// The protocol itself, with no I/O in it.
+//
+// Every operation is a Request - a URL to GET, plus the fresh secrets that must
+// survive if the answer is lost - paired with a Parse* function for what comes
+// back. A caller with its own HTTP stack needs nothing else; Client is a thin
+// loop over exactly these.
+
+// Request is one GET, and the secrets whose loss would destroy money.
+type Request struct {
+	URL string
+	// NewSecrets are the fresh wallet-generated secrets this request disclosed
+	// the hashes of. If the outcome turns out to be unknown they may be the only
+	// copies of notes the service has already minted, so persist them before
+	// performing the GET.
+	NewSecrets []string
+}
+
+// WithdrawInfo is the informational GET's answer.
+type WithdrawInfo struct {
+	Callback string
+	K1       string
+	// MaxWithdrawableMsat is the ONLY authoritative statement of what a note is
+	// worth. The amount in a note URL is an unverified claim.
+	MaxWithdrawableMsat int64
+	MinWithdrawableMsat int64
+	DefaultDescription  string
+	// MintPubkey is present when the service signs its notes.
+	MintPubkey string
+}
+
+// MintAddress is the experimental withdraw-side discovery response.
+type MintAddress struct {
+	Callback            string
+	PayLink             string
+	MaxWithdrawableMsat int64
+	MinWithdrawableMsat int64
+	// The wire field is mintPubkey, but at this endpoint it is never a note's
+	// signing key - always the service's own node identity.
+	NodePubkey string
+	NodeAlias  string
+	NodeURI    string
+	NodeColor  string
+}
+
+// PayRequest is a LUD-06 payRequest, extended per LUD-25.
+type PayRequest struct {
+	Callback        string
+	MinSendableMsat int64
+	MaxSendableMsat int64
+	Metadata        string
+	// WithdrawLink is present when paying this mints a bearer note.
+	WithdrawLink string
+	MintPubkey   string
+	// MintFee is valid only when HasMintFee is true. Absent means the service
+	// advertised none, which the spec reads as fee-free rather than unknown.
+	MintFee    MintFee
+	HasMintFee bool
+}
+
+// Invoice is a payRequest callback's answer.
+type Invoice struct {
+	PR        string
+	VerifyURL string
+	// Disposable follows LUD-11: absent on the wire MUST be read as true.
+	Disposable bool
+}
+
+// InvoiceStatus is a LUD-21 verify answer.
+type InvoiceStatus struct {
+	Settled bool
+	// Preimage, for LNURLcash, IS the bearer note's spend secret. Rotate at once.
+	Preimage string
+	PR       string
+}
+
+// Mutation is a mutating callback's answer.
+type Mutation struct {
+	Signature       string
+	ChangeSignature string
+	// PR and VerifyURL form the optional LUD-25 melt proof.
+	PR        string
+	VerifyURL string
+}
+
+func withParams(rawURL string, params [][2]string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	// append, never replace: a merge repeats the k1 parameter, and a callback may
+	// already carry parameters of its own
+	pairs := parseOrdered(parsed.RawQuery)
+	pairs = append(pairs, params...)
+	parsed.RawQuery = encodePairs(pairs)
+	return parsed.String(), nil
+}
+
+func decode(body []byte) (map[string]any, error) {
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, &AmbiguousError{Detail: "the service returned an unreadable response", Cause: err}
+	}
+	return parsed, nil
+}
+
+// rejectError turns a service's ERROR into a definitive failure. The reason is
+// carried through exactly as sent, empty included.
+func rejectError(body map[string]any) error {
+	if status, _ := body["status"].(string); status == "ERROR" {
+		reason, _ := body["reason"].(string)
+		return &ServiceError{Reason: reason}
+	}
+	return nil
+}
+
+func str(body map[string]any, key string) string {
+	value, _ := body[key].(string)
+	return value
+}
+
+func msat(body map[string]any, key string) (int64, bool) {
+	switch value := body[key].(type) {
+	case float64:
+		return int64(value), true
+	case json.Number:
+		parsed, err := value.Int64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// ---- the informational GET ----
+
+// NoteInfoRequest builds the LUD-03 informational GET. It never burns, rotates
+// or alters the note.
+//
+// sig is stripped before the request: it is only meaningful to a holder
+// inspecting the note locally, since the service already knows what it signed.
+// k1 and amount are left as they are.
+func NoteInfoRequest(noteURL string) (Request, error) {
+	parsed, err := url.Parse(noteURL)
+	if err != nil {
+		return Request{}, fmt.Errorf("%w: that note URL does not parse", ErrRequestRefused)
+	}
+	pairs := parseOrdered(parsed.RawQuery)
+	kept := pairs[:0]
+	for _, pair := range pairs {
+		if pair[0] != "sig" {
+			kept = append(kept, pair)
+		}
+	}
+	parsed.RawQuery = encodePairs(kept)
+	return Request{URL: parsed.String()}, nil
+}
+
+// ParseNoteInfo reads an informational GET's answer.
+func ParseNoteInfo(body []byte, queriedURL string) (WithdrawInfo, error) {
+	parsed, err := decode(body)
+	if err != nil {
+		return WithdrawInfo{}, err
+	}
+	if err := rejectError(parsed); err != nil {
+		var service *ServiceError
+		_ = asService(err, &service)
+		return WithdrawInfo{}, classifyNoteError(service.Reason)
+	}
+	invalid := &ProtocolError{Detail: "not a withdrawRequest (unexpected response)"}
+	if str(parsed, "tag") != "withdrawRequest" {
+		return WithdrawInfo{}, invalid
+	}
+	callback, k1 := str(parsed, "callback"), str(parsed, "k1")
+	maximum, ok := msat(parsed, "maxWithdrawable")
+	if callback == "" || k1 == "" || !ok || maximum < 0 {
+		return WithdrawInfo{}, invalid
+	}
+	minimum := int64(0)
+	if _, present := parsed["minWithdrawable"]; present && parsed["minWithdrawable"] != nil {
+		minimum, ok = msat(parsed, "minWithdrawable")
+		if !ok || minimum < 0 || minimum > maximum {
+			return WithdrawInfo{}, invalid
+		}
+	}
+	// Spec MUST: the response's k1 is the bearer secret itself, never a derived
+	// or opaque id. A service returning something else for the k1 it was queried
+	// with is non-compliant - or the note was rotated by somebody else, which
+	// matters more.
+	if queried := NoteK1(queriedURL); queried != "" && strings.ToLower(k1) != queried {
+		return WithdrawInfo{}, &ProtocolError{
+			Detail: "the service echoed back a different k1 than was queried - the note may have been redeemed elsewhere, or the service isn't spec-compliant",
+		}
+	}
+	return WithdrawInfo{
+		Callback:            callback,
+		K1:                  strings.ToLower(k1),
+		MaxWithdrawableMsat: maximum,
+		MinWithdrawableMsat: minimum,
+		DefaultDescription:  str(parsed, "defaultDescription"),
+		MintPubkey:          str(parsed, "mintPubkey"),
+	}, nil
+}
+
+// MintAddressRequest builds the experimental mint-address GET. Best-effort
+// discovery: most services will not have it, and a rejection means "no extra
+// information", not a failure.
+func MintAddressRequest(rawURL string) (Request, error) {
+	return Request{URL: rawURL}, nil
+}
+
+// ParseMintAddress reads a mint-address answer.
+func ParseMintAddress(body []byte) (MintAddress, error) {
+	parsed, err := decode(body)
+	if err != nil {
+		return MintAddress{}, err
+	}
+	if err := rejectError(parsed); err != nil {
+		return MintAddress{}, err
+	}
+	invalid := &ProtocolError{Detail: "not a mint address response (unexpected shape)"}
+	if str(parsed, "tag") != "withdrawRequest" {
+		return MintAddress{}, invalid
+	}
+	maximum, ok := msat(parsed, "maxWithdrawable")
+	if str(parsed, "callback") == "" || str(parsed, "payLink") == "" || !ok {
+		return MintAddress{}, invalid
+	}
+	minimum, _ := msat(parsed, "minWithdrawable")
+	return MintAddress{
+		Callback:            str(parsed, "callback"),
+		PayLink:             str(parsed, "payLink"),
+		MaxWithdrawableMsat: maximum,
+		MinWithdrawableMsat: minimum,
+		NodePubkey:          str(parsed, "mintPubkey"),
+		NodeAlias:           str(parsed, "nodeAlias"),
+		NodeURI:             str(parsed, "nodeUri"),
+		NodeColor:           str(parsed, "nodeColor"),
+	}, nil
+}
+
+// ---- the mutating callback ----
+
+func callbackURL(callback string, params [][2]string) (string, error) {
+	if !IsAllowedServiceURL(callback) {
+		return "", fmt.Errorf("%w: the service provided an invalid callback URL", ErrRequestRefused)
+	}
+	hasK1 := false
+	for _, pair := range params {
+		if pair[0] == "k1" {
+			hasK1 = true
+			break
+		}
+	}
+	if !hasK1 {
+		// Nothing to operate on. Worth refusing here rather than letting it become
+		// a callback with no k1, whose meaning is entirely up to the service -
+		// and which, read generously, could burn something the caller never named.
+		return "", fmt.Errorf("%w: at least one k1 is required - there is no note to operate on", ErrRequestRefused)
+	}
+	return withParams(callback, params)
+}
+
+// MeltRequest burns a single note; the service pays pr of exactly its value.
+// Merge several notes first to melt them together - LUD-25 dropped multi-k1
+// melt.
+//
+// A confirmation means the payment is IN FLIGHT, not that the note is spent.
+// The service pays asynchronously and only finalises the burn once the payment
+// settles, restoring the note if it fails - so a melt failure is never reported
+// through this call, only observed as the note becoming spendable again.
+func MeltRequest(callback, k1, pr string) (Request, error) {
+	built, err := callbackURL(callback, [][2]string{{"k1", k1}, {"pr", strings.TrimSpace(pr)}})
+	if err != nil {
+		return Request{}, err
+	}
+	return Request{URL: built}, nil
+}
+
+// RotateRequestWithHash builds a rotate for a hash the caller already holds -
+// what a hardware wallet drives, where the secret never enters this process.
+func RotateRequestWithHash(callback, k1, h string) (Request, error) {
+	built, err := callbackURL(callback, [][2]string{{"k1", k1}, {"h", h}})
+	if err != nil {
+		return Request{}, err
+	}
+	return Request{URL: built}, nil
+}
+
+// SplitRequestWithHash builds a split for hashes the caller already holds.
+func SplitRequestWithHash(callback string, k1s []string, amountMsat int64, h, h2 string) (Request, error) {
+	params := make([][2]string, 0, len(k1s)+3)
+	for _, k1 := range k1s {
+		params = append(params, [2]string{"k1", k1})
+	}
+	params = append(params,
+		[2]string{"amount", strconv.FormatInt(amountMsat, 10)},
+		[2]string{"h", h},
+		[2]string{"h2", h2},
+	)
+	built, err := callbackURL(callback, params)
+	if err != nil {
+		return Request{}, err
+	}
+	return Request{URL: built}, nil
+}
+
+// MergeRequestWithHash builds a merge for a hash the caller already holds.
+func MergeRequestWithHash(callback string, k1s []string, h string) (Request, error) {
+	params := make([][2]string, 0, len(k1s)+1)
+	for _, k1 := range k1s {
+		params = append(params, [2]string{"k1", k1})
+	}
+	params = append(params, [2]string{"h", h})
+	built, err := callbackURL(callback, params)
+	if err != nil {
+		return Request{}, err
+	}
+	return Request{URL: built}, nil
+}
+
+// The generating variants.
+//
+// Per LUD-25 the wallet generates the replacement secret and discloses only its
+// hash. The service never sees, generates or persists it, which is what closes
+// the prior-holder exposure a service-generated replacement would otherwise
+// reopen on every single rotate.
+//
+// The secrets are passed in rather than drawn here, so a hardware wallet can
+// supply them from its own RNG and a test can be deterministic.
+
+// RotateRequest builds a rotate that mints newSecret.
+func RotateRequest(callback, k1, newSecret string) (Request, error) {
+	h, err := HashK1(newSecret)
+	if err != nil {
+		return Request{}, err
+	}
+	request, err := RotateRequestWithHash(callback, k1, h)
+	if err != nil {
+		return Request{}, err
+	}
+	request.NewSecrets = []string{newSecret}
+	return request, nil
+}
+
+// SplitRequest builds a split that mints newSecret and changeSecret.
+func SplitRequest(callback string, k1s []string, amountMsat int64, newSecret, changeSecret string) (Request, error) {
+	h, err := HashK1(newSecret)
+	if err != nil {
+		return Request{}, err
+	}
+	h2, err := HashK1(changeSecret)
+	if err != nil {
+		return Request{}, err
+	}
+	request, err := SplitRequestWithHash(callback, k1s, amountMsat, h, h2)
+	if err != nil {
+		return Request{}, err
+	}
+	request.NewSecrets = []string{newSecret, changeSecret}
+	return request, nil
+}
+
+// MergeRequest builds a merge that mints newSecret.
+func MergeRequest(callback string, k1s []string, newSecret string) (Request, error) {
+	h, err := HashK1(newSecret)
+	if err != nil {
+		return Request{}, err
+	}
+	request, err := MergeRequestWithHash(callback, k1s, h)
+	if err != nil {
+		return Request{}, err
+	}
+	request.NewSecrets = []string{newSecret}
+	return request, nil
+}
+
+// ParseMutation classifies a mutating callback's response.
+//
+// A 200 that does not confirm is an AmbiguousError, not a failure: the service
+// may have applied the mutation and merely failed to say so. newSecrets are
+// attached to any ambiguous outcome so nothing can lose them between the call
+// and the check.
+func ParseMutation(body []byte, newSecrets []string) (Mutation, error) {
+	parsed, err := decode(body)
+	if err != nil {
+		var ambiguous *AmbiguousError
+		if asAmbiguous(err, &ambiguous) {
+			ambiguous.NewSecrets = newSecrets
+		}
+		return Mutation{}, err
+	}
+	if err := rejectError(parsed); err != nil {
+		var service *ServiceError
+		_ = asService(err, &service)
+		return Mutation{}, classifyNoteError(service.Reason)
+	}
+	if str(parsed, "status") != "OK" {
+		return Mutation{}, &AmbiguousError{
+			Detail:     "the service did not confirm the operation - it may still have been applied",
+			NewSecrets: newSecrets,
+		}
+	}
+	return Mutation{
+		Signature:       str(parsed, "sig"),
+		ChangeSignature: str(parsed, "sig2"),
+		PR:              str(parsed, "pr"),
+		VerifyURL:       str(parsed, "verify"),
+	}, nil
+}
+
+// ---- minting ----
+
+// PayRequestRequest builds the payRequest GET.
+func PayRequestRequest(rawURL string) (Request, error) {
+	return Request{URL: rawURL}, nil
+}
+
+// ParsePayRequest reads a payRequest.
+func ParsePayRequest(body []byte) (PayRequest, error) {
+	parsed, err := decode(body)
+	if err != nil {
+		return PayRequest{}, err
+	}
+	if err := rejectError(parsed); err != nil {
+		return PayRequest{}, err
+	}
+	if str(parsed, "tag") != "payRequest" || str(parsed, "callback") == "" {
+		return PayRequest{}, &ProtocolError{Detail: "not a payRequest (unexpected response)"}
+	}
+	metadata := str(parsed, "metadata")
+	minSendable, _ := msat(parsed, "minSendable")
+	maxSendable, _ := msat(parsed, "maxSendable")
+	fee, hasFee := ParseMintFee(metadata)
+	return PayRequest{
+		Callback:        str(parsed, "callback"),
+		MinSendableMsat: minSendable,
+		MaxSendableMsat: maxSendable,
+		Metadata:        metadata,
+		WithdrawLink:    str(parsed, "withdrawLink"),
+		MintPubkey:      str(parsed, "mintPubkey"),
+		MintFee:         fee,
+		HasMintFee:      hasFee,
+	}, nil
+}
+
+// InvoiceRequest builds the payRequest callback GET for an amount.
+func InvoiceRequest(payCallback string, amountMsat int64) (Request, error) {
+	built, err := withParams(payCallback, [][2]string{{"amount", strconv.FormatInt(amountMsat, 10)}})
+	if err != nil {
+		return Request{}, fmt.Errorf("%w: that pay callback does not parse", ErrRequestRefused)
+	}
+	return Request{URL: built}, nil
+}
+
+// ParseInvoice reads an invoice, refusing one for the wrong amount.
+func ParseInvoice(body []byte, requestedMsat int64) (Invoice, error) {
+	parsed, err := decode(body)
+	if err != nil {
+		return Invoice{}, err
+	}
+	if err := rejectError(parsed); err != nil {
+		return Invoice{}, err
+	}
+	pr := str(parsed, "pr")
+	if pr == "" {
+		return Invoice{}, &ProtocolError{Detail: "the service did not return an invoice"}
+	}
+	// A service answering an amount request with an invoice for a DIFFERENT
+	// amount is broken or hostile. An amountless invoice passes through: there is
+	// nothing to check it against here.
+	if invoiced, ok := DecodeBolt11AmountMsat(pr); ok && invoiced != requestedMsat {
+		return Invoice{}, &ProtocolError{
+			Detail: fmt.Sprintf("the service returned an invoice for %d msat, not the %d requested", invoiced, requestedMsat),
+		}
+	}
+	disposable := true
+	if value, ok := parsed["disposable"].(bool); ok && !value {
+		disposable = false
+	}
+	return Invoice{PR: pr, VerifyURL: str(parsed, "verify"), Disposable: disposable}, nil
+}
+
+// VerifyRequest builds a LUD-21 verify GET.
+//
+// For LNURLcash specifically, a settled invoice's preimage IS the bearer note's
+// spend secret, and a verify GET proves nothing about who is asking - only that
+// they know the payment hash, which travels inside the invoice itself. A caller
+// receiving a preimage here MUST rotate immediately.
+func VerifyRequest(verifyURL string) (Request, error) {
+	return Request{URL: verifyURL}, nil
+}
+
+// ParseVerify reads a LUD-21 verify answer.
+func ParseVerify(body []byte) (InvoiceStatus, error) {
+	parsed, err := decode(body)
+	if err != nil {
+		return InvoiceStatus{}, err
+	}
+	if err := rejectError(parsed); err != nil {
+		return InvoiceStatus{}, err
+	}
+	settled, ok := parsed["settled"].(bool)
+	pr := str(parsed, "pr")
+	if !ok || pr == "" {
+		return InvoiceStatus{}, &ProtocolError{Detail: "the service returned an unexpected verify response"}
+	}
+	return InvoiceStatus{Settled: settled, Preimage: str(parsed, "preimage"), PR: pr}, nil
+}

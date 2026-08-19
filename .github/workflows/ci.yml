@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ['1.22', '1.23']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      # the mock mint is a Node process from the conformance repo, and the
+      # vectors come from there too
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/checkout@v4
+        with:
+          repository: TheCryptoDonkey/lnurlcash-conformance
+          path: conformance
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go build ./...
+      - run: go test ./...
+        env:
+          LNURLCASH_CONFORMANCE: ${{ github.workspace }}/conformance

@@ -1,0 +1,66 @@
+# lnurlcash-go
+
+LNURLcash (LUD-25) bearer note client for Go. MIT.
+
+go get github.com/TheCryptoDonkey/lnurlcash-go
+
+## CRITICAL: HTTP retries
+
+Every LNURLcash mutation (rotate/split/merge/melt) is an HTTP GET, but is NOT
+idempotent - the first attempt burns the input note. net/http retries an
+idempotent request sent on a REUSED connection, and a client with no Transport
+uses the process-wide http.DefaultTransport pool. A retried mutation gets
+"already spent" for its second attempt and reports a DEFINITIVE rejection, so
+the caller discards the fresh secret that was the only copy of the note.
+
+NewClient() sets DisableKeepAlives for this reason. A caller-supplied
+*http.Client MUST do the same.
+
+## API
+
+client := lnurlcash.NewClient()   // fields: HTTP, Timeout, Offline, Secrets
+
+client.FetchNoteInfo(ctx, url) (WithdrawInfo, error)   // MaxWithdrawableMsat is authoritative
+client.RotateNote(ctx, callback, k1) (RotatedNote, error)
+client.SplitNote(ctx, callback, k1s, amountMsat) (SplitNotes, error)
+client.MergeNotes(ctx, callback, k1s) (RotatedNote, error)
+client.MeltNote(ctx, callback, k1, pr) (Mutation, error)
+client.SettleNote(ctx, baseURL, k1, expectedMsat, sig) (SettledNote, error)
+client.ProbeBurnedNote(ctx, url) NoteFate    // NoteLive | NoteGone | NoteFateUnknown
+client.FetchPayRequest / RequestInvoice / FetchInvoiceStatus / FetchMintAddress
+
+Pure functions: VerifyNoteSignature, GenerateNoteSecret, HashK1, IsPreimage,
+ResolveNoteInput, ResolveMintInput, ResolveLnurlInput, IsAllowedServiceURL,
+BuildNoteURL, WithNewK1, WithoutK1, NoteK1, NoteDeclaredAmountMsat,
+NoteSignature, ParseMintFee, ApplyMintFee, GrossUpForMintFee, DescribeMintFee,
+DecodeBolt11AmountMsat, IsBolt11Invoice, SameInvoice.
+
+No-I/O protocol layer: RotateRequest / SplitRequest / MergeRequest /
+MeltRequest / NoteInfoRequest / InvoiceRequest / VerifyRequest return
+Request{URL, NewSecrets}; ParseNoteInfo / ParseMutation / ParseInvoice /
+ParseVerify / ParsePayRequest / ParseMintAddress read the body.
+
+Amounts are int64 milli-satoshis everywhere.
+
+## Errors
+
+errors.Is(err, ErrRequestRefused)  nothing sent, note untouched
+errors.Is(err, ErrNotePending)     a melt is in flight - retry, NOT spent
+IsSpent(err)                       authoritative: already burned
+IsUnknownNote(err)                 service does not recognise it
+IsAmbiguous(err)                   outcome UNKNOWN - assume nothing
+NewSecrets(err)                    the secrets an ambiguous mutation carried
+*ProtocolError                     a non-mutating response did not match the spec
+
+## Rules
+
+1. MaxWithdrawableMsat is the ONLY authoritative value; a note URL's amount is a claim.
+2. The wallet generates replacement secrets; never accept a service-supplied k1.
+3. On IsAmbiguous: persist NewSecrets(err) FIRST, then ProbeBurnedNote.
+4. A melt's success means IN FLIGHT. ErrNotePending means retry, not spent.
+5. Rotate immediately after claiming a minted note.
+6. Never log note URLs - the secret is in the query string.
+
+## Conformance
+
+https://github.com/TheCryptoDonkey/lnurlcash-conformance
