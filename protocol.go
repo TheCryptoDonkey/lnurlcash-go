@@ -50,6 +50,12 @@ type MintAddress struct {
 	NodeAlias  string
 	NodeURI    string
 	NodeColor  string
+	// The wire field is nodeCapacity, msat like every other amount here -
+	// suffixed so a caller cannot read it as sats. Zero on all three means
+	// the service advertised nothing, the same as an empty NodeAlias.
+	NodeCapacityMsat int64
+	NodeNumChannels  int64
+	NodeNumPeers     int64
 }
 
 // PayRequest is a LUD-06 payRequest, extended per LUD-25.
@@ -235,6 +241,9 @@ func ParseMintAddress(body []byte) (MintAddress, error) {
 		return MintAddress{}, invalid
 	}
 	minimum, _ := msat(parsed, "minWithdrawable")
+	capacity, _ := msat(parsed, "nodeCapacity")
+	channels, _ := msat(parsed, "nodeNumChannels")
+	peers, _ := msat(parsed, "nodeNumPeers")
 	return MintAddress{
 		Callback:            str(parsed, "callback"),
 		PayLink:             str(parsed, "payLink"),
@@ -244,6 +253,9 @@ func ParseMintAddress(body []byte) (MintAddress, error) {
 		NodeAlias:           str(parsed, "nodeAlias"),
 		NodeURI:             str(parsed, "nodeUri"),
 		NodeColor:           str(parsed, "nodeColor"),
+		NodeCapacityMsat:    capacity,
+		NodeNumChannels:     channels,
+		NodeNumPeers:        peers,
 	}, nil
 }
 

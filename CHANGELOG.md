@@ -13,6 +13,13 @@ and the adversarial mock mint.
 
 ### Design notes
 
+**The mint address carries the node stats under their wire names.** lnurl-mint
+advertises `nodeCapacity` in msat, so `NodeCapacityMsat` is a rename and is
+mapped explicitly — the TypeScript sibling shipped that rename unmapped and
+read undefined for every mint.
+
+
+
 **`NewClient` disables keep-alives.** `net/http` retries an idempotent request
 that was sent on a reused connection, and every LNURLcash mutation is a GET
 that is not idempotent — so a retry gets "already spent" for its second attempt

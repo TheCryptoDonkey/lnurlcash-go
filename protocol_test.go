@@ -483,6 +483,14 @@ func TestFindsTheExperimentalMintAddress(t *testing.T) {
 	if address.NodePubkey != mint.pubkey {
 		t.Fatalf("node pubkey = %s", address.NodePubkey)
 	}
+	// the wire field is nodeCapacity - renamed here, so it only arrives if it
+	// is mapped rather than read under its own name
+	if address.NodeCapacityMsat != 500_000_000 {
+		t.Fatalf("node capacity = %d msat", address.NodeCapacityMsat)
+	}
+	if address.NodeNumChannels != 4 || address.NodeNumPeers != 6 {
+		t.Fatalf("channels = %d, peers = %d", address.NodeNumChannels, address.NodeNumPeers)
+	}
 }
 
 // ---- ambiguous outcomes ----
