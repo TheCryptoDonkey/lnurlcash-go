@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -400,7 +401,7 @@ func TestAFailedMeltRestoresTheNote(t *testing.T) {
 
 // ---- minting ----
 
-func TestMintsANoteFromAPaidInvoiceAndRotatesIt(t *testing.T) {
+func TestMintsANoteTheServiceNeverSawTheSecretOf(t *testing.T) {
 	mint := startMint(t)
 	client := lnurlcash.NewClient()
 
@@ -411,7 +412,16 @@ func TestMintsANoteFromAPaidInvoiceAndRotatesIt(t *testing.T) {
 	if pay.WithdrawLink == "" {
 		t.Fatal("not a minting payRequest")
 	}
-	invoice, err := client.RequestInvoice(ctx(t), pay.Callback, 21000)
+	// LUD-25 minting is comment-bound, so a mint must leave room for the
+	// 64-character commitment. Without it there is nowhere to name the note.
+	if !pay.NamesMintOutput() || pay.CommentAllowed != 64 {
+		t.Fatalf("commentAllowed = %d (present %v)", pay.CommentAllowed, pay.HasCommentAllowed)
+	}
+
+	// The wallet chooses the secret, before any invoice exists, and persists it
+	// before paying. The service is told sha256 of it and nothing more.
+	mintSecret := secret(42)
+	invoice, err := client.RequestMintInvoice(ctx(t), pay.Callback, 21000, mintSecret)
 	if err != nil {
 		t.Fatalf("invoice: %v", err)
 	}
@@ -425,27 +435,58 @@ func TestMintsANoteFromAPaidInvoiceAndRotatesIt(t *testing.T) {
 	if err != nil || !status.Settled {
 		t.Fatalf("verify: %+v (%v)", status, err)
 	}
-	// the preimage IS the note secret - which the mint necessarily saw
-	claimed := status.Preimage
-	if id, _ := lnurlcash.HashK1(claimed); id != paymentHash {
+	// The preimage is settlement proof and nothing else. Every node that
+	// forwarded the payment learned it; under the earlier draft that made all of
+	// them holders of the note. Here it redeems nothing.
+	preimage := status.Preimage
+	if id, _ := lnurlcash.HashK1(preimage); id != paymentHash {
 		t.Fatalf("the preimage does not hash to the payment hash")
 	}
+	if preimage == mintSecret {
+		t.Fatal("the mint must not know the note secret")
+	}
+	preimageURL := lnurlcash.BuildNoteURL(pay.WithdrawLink, preimage, -1)
+	if _, err := client.FetchNoteInfo(ctx(t), preimageURL); err == nil {
+		t.Fatal("the payment preimage must not redeem the note")
+	}
 
-	noteURL := lnurlcash.BuildNoteURL(pay.WithdrawLink, claimed, -1)
+	// The wallet's own secret is the note.
+	noteURL := lnurlcash.BuildNoteURL(pay.WithdrawLink, mintSecret, -1)
 	info, err := client.FetchNoteInfo(ctx(t), noteURL)
 	if err != nil || info.MaxWithdrawableMsat != 21000 {
-		t.Fatalf("claimed note = %d (%v)", info.MaxWithdrawableMsat, err)
+		t.Fatalf("minted note = %d (%v)", info.MaxWithdrawableMsat, err)
 	}
-	rotated, err := client.RotateNote(ctx(t), info.Callback, claimed)
+	rotated, err := client.RotateNote(ctx(t), info.Callback, mintSecret)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
-	// after rotating, the secret the mint generated is worthless
-	if state := mint.noteState(t, claimed); state != "burned" {
-		t.Fatalf("the mint-generated secret is still live: %s", state)
+	if state := mint.noteState(t, mintSecret); state != "burned" {
+		t.Fatalf("the spent secret is still live: %s", state)
 	}
 	if state := mint.noteState(t, rotated.K1); state != "outstanding" {
 		t.Fatalf("rotated note state = %s", state)
+	}
+}
+
+func TestRefusesToPayForANoteItCannotName(t *testing.T) {
+	mint := startMint(t)
+	client := lnurlcash.NewClient()
+
+	pay, err := client.FetchPayRequest(ctx(t), mint.payURL())
+	if err != nil {
+		t.Fatalf("payRequest: %v", err)
+	}
+
+	// A malformed commitment is refused before the request leaves, so a wallet
+	// never pays for a quote the service was always going to reject.
+	if _, err := client.RequestMintInvoice(ctx(t), pay.Callback, 21000, "not-a-32-byte-secret"); !errors.Is(err, lnurlcash.ErrRequestRefused) {
+		t.Fatalf("malformed secret = %v, want ErrRequestRefused", err)
+	}
+
+	// And an unnamed mint quote is refused by the service itself, before any
+	// invoice exists to pay.
+	if _, err := client.RequestInvoice(ctx(t), pay.Callback, 21000); err == nil {
+		t.Fatal("an unnamed mint quote must be refused")
 	}
 }
 

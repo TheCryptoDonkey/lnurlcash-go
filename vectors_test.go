@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	lnurlcash "github.com/TheCryptoDonkey/lnurlcash-go"
@@ -418,4 +419,177 @@ func TestBolt11Vectors(t *testing.T) {
 
 func asProtocol(err error, target **lnurlcash.ProtocolError) bool {
 	return errors.As(err, target)
+}
+
+// TestPayRequestVectors binds LUD-25 minting to pay-request.json.
+//
+// This is the suite that would have caught the package sitting on the deleted
+// preimage-keyed model for a month: nothing here states an opinion of its own,
+// so a draft change lands as a red test rather than as a silent divergence
+// discovered by a wallet that could not mint.
+func TestPayRequestVectors(t *testing.T) {
+	vectors := loadVectors(t, "pay-request.json")
+
+	var accepted []struct {
+		Name           string          `json:"name"`
+		Body           json.RawMessage `json:"body"`
+		WithdrawLink   string          `json:"withdrawLink"`
+		CommentAllowed *int64          `json:"commentAllowed"`
+		MintFee        *feeVector      `json:"mintFee"`
+	}
+	unmarshalInto(t, vectors["accepted"], &accepted)
+	for _, testCase := range accepted {
+		parsed, err := lnurlcash.ParsePayRequest(testCase.Body)
+		if err != nil {
+			t.Fatalf("%s: expected a parse, got %v", testCase.Name, err)
+		}
+		if parsed.WithdrawLink != testCase.WithdrawLink {
+			t.Errorf("%s: withdrawLink = %q, want %q", testCase.Name, parsed.WithdrawLink, testCase.WithdrawLink)
+		}
+		wantComment := testCase.CommentAllowed != nil
+		if parsed.HasCommentAllowed != wantComment {
+			t.Errorf("%s: commentAllowed present = %v, want %v", testCase.Name, parsed.HasCommentAllowed, wantComment)
+		}
+		if wantComment && parsed.CommentAllowed != *testCase.CommentAllowed {
+			t.Errorf("%s: commentAllowed = %d, want %d", testCase.Name, parsed.CommentAllowed, *testCase.CommentAllowed)
+		}
+		if parsed.HasMintFee != (testCase.MintFee != nil) {
+			t.Errorf("%s: mint fee present = %v", testCase.Name, parsed.HasMintFee)
+		}
+		if testCase.MintFee != nil && parsed.MintFee != testCase.MintFee.fee() {
+			t.Errorf("%s: mint fee = %+v, want %+v", testCase.Name, parsed.MintFee, testCase.MintFee.fee())
+		}
+		// A payRequest is only a mint if it can carry the commitment, and a
+		// mint is only a mint if it advertises where the note will live.
+		if parsed.NamesMintOutput() != (parsed.WithdrawLink != "") {
+			t.Errorf("%s: minting capability must track withdrawLink", testCase.Name)
+		}
+	}
+
+	var rejected []struct {
+		Name string          `json:"name"`
+		Body json.RawMessage `json:"body"`
+	}
+	unmarshalInto(t, vectors["rejected"], &rejected)
+	for _, testCase := range rejected {
+		if _, err := lnurlcash.ParsePayRequest(testCase.Body); err == nil {
+			t.Errorf("%s: must not parse", testCase.Name)
+		}
+	}
+
+	// The mint callback names the note before the invoice exists.
+	const callback = "https://mint.example/p/cb"
+	var mintCallback struct {
+		Accepted []struct {
+			Name                      string `json:"name"`
+			AmountMsat                int64  `json:"amountMsat"`
+			Comment                   string `json:"comment"`
+			NoteID                    string `json:"noteId"`
+			PaymentPreimageIsBearerK1 bool   `json:"paymentPreimageIsBearerK1"`
+		} `json:"accepted"`
+		Rejected []struct {
+			Name       string  `json:"name"`
+			AmountMsat int64   `json:"amountMsat"`
+			Comment    *string `json:"comment"`
+		} `json:"rejected"`
+	}
+	unmarshalInto(t, vectors["mintCallback"], &mintCallback)
+	for _, testCase := range mintCallback.Accepted {
+		request, err := lnurlcash.MintInvoiceRequestWithHash(callback, testCase.AmountMsat, testCase.Comment)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		// LUD-25 carries the commitment as a mandatory LUD-12 comment; h
+		// repeats it for the additive ForgeSworn profile.
+		if !strings.Contains(request.URL, "comment="+testCase.Comment) {
+			t.Errorf("%s: the commitment must ride as a comment - got %s", testCase.Name, request.URL)
+		}
+		if !strings.Contains(request.URL, "h="+testCase.Comment) {
+			t.Errorf("%s: h must repeat the commitment", testCase.Name)
+		}
+		if testCase.NoteID != testCase.Comment {
+			t.Errorf("%s: the note is keyed by the commitment", testCase.Name)
+		}
+		if testCase.PaymentPreimageIsBearerK1 {
+			t.Errorf("%s: the preimage is settlement proof, never the note", testCase.Name)
+		}
+	}
+	for _, testCase := range mintCallback.Rejected {
+		// A null comment is the unnamed mint the draft forbids: this package
+		// cannot express one, because the minting builder requires the
+		// commitment. A malformed one is refused before anything is sent.
+		if testCase.Comment == nil {
+			if _, err := lnurlcash.MintInvoiceRequest(callback, testCase.AmountMsat, ""); !errors.Is(err, lnurlcash.ErrRequestRefused) {
+				t.Errorf("%s: an unnamed mint must be impossible to build", testCase.Name)
+			}
+			continue
+		}
+		if _, err := lnurlcash.MintInvoiceRequestWithHash(callback, testCase.AmountMsat, *testCase.Comment); !errors.Is(err, lnurlcash.ErrRequestRefused) {
+			t.Errorf("%s: a malformed commitment must be refused before it is sent", testCase.Name)
+		}
+	}
+
+	var invoice struct {
+		Accepted []struct {
+			Name          string          `json:"name"`
+			RequestedMsat int64           `json:"requestedMsat"`
+			Body          json.RawMessage `json:"body"`
+			Disposable    bool            `json:"disposable"`
+			Verify        string          `json:"verify"`
+		} `json:"accepted"`
+		Rejected []struct {
+			Name          string          `json:"name"`
+			RequestedMsat int64           `json:"requestedMsat"`
+			Body          json.RawMessage `json:"body"`
+		} `json:"rejected"`
+	}
+	unmarshalInto(t, vectors["invoice"], &invoice)
+	for _, testCase := range invoice.Accepted {
+		parsed, err := lnurlcash.ParseInvoice(testCase.Body, testCase.RequestedMsat)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		if parsed.Disposable != testCase.Disposable {
+			t.Errorf("%s: disposable = %v, want %v", testCase.Name, parsed.Disposable, testCase.Disposable)
+		}
+		if parsed.VerifyURL != testCase.Verify {
+			t.Errorf("%s: verify = %q, want %q", testCase.Name, parsed.VerifyURL, testCase.Verify)
+		}
+	}
+	for _, testCase := range invoice.Rejected {
+		if _, err := lnurlcash.ParseInvoice(testCase.Body, testCase.RequestedMsat); err == nil {
+			t.Errorf("%s: must not parse", testCase.Name)
+		}
+	}
+
+	var verify struct {
+		Accepted []struct {
+			Name     string          `json:"name"`
+			Body     json.RawMessage `json:"body"`
+			Settled  bool            `json:"settled"`
+			Preimage string          `json:"preimage"`
+		} `json:"accepted"`
+		Rejected []struct {
+			Name string          `json:"name"`
+			Body json.RawMessage `json:"body"`
+		} `json:"rejected"`
+	}
+	unmarshalInto(t, vectors["verify"], &verify)
+	for _, testCase := range verify.Accepted {
+		parsed, err := lnurlcash.ParseVerify(testCase.Body)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		if parsed.Settled != testCase.Settled {
+			t.Errorf("%s: settled = %v, want %v", testCase.Name, parsed.Settled, testCase.Settled)
+		}
+		if parsed.Preimage != testCase.Preimage {
+			t.Errorf("%s: preimage = %q, want %q", testCase.Name, parsed.Preimage, testCase.Preimage)
+		}
+	}
+	for _, testCase := range verify.Rejected {
+		if _, err := lnurlcash.ParseVerify(testCase.Body); err == nil {
+			t.Errorf("%s: must not parse", testCase.Name)
+		}
+	}
 }

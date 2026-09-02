@@ -275,9 +275,28 @@ func (c *Client) FetchPayRequest(ctx context.Context, rawURL string) (PayRequest
 	return ParsePayRequest(body)
 }
 
-// RequestInvoice asks a mint for an invoice whose preimage will become a note.
+// RequestInvoice asks for a plain LUD-06 invoice. It mints nothing: it names no
+// output.
 func (c *Client) RequestInvoice(ctx context.Context, payCallback string, amountMsat int64) (Invoice, error) {
 	request, err := InvoiceRequest(payCallback, amountMsat)
+	if err != nil {
+		return Invoice{}, err
+	}
+	body, err := c.do(ctx, request)
+	if err != nil {
+		return Invoice{}, err
+	}
+	return ParseInvoice(body, amountMsat)
+}
+
+// RequestMintInvoice asks for an invoice that mints a note the caller already
+// holds the secret to.
+//
+// Persist mintSecret before paying the invoice this returns. The service only
+// ever learns its hash, so it cannot help reconstruct it, and a paid invoice
+// whose secret was lost is a note nobody can spend.
+func (c *Client) RequestMintInvoice(ctx context.Context, payCallback string, amountMsat int64, mintSecret string) (Invoice, error) {
+	request, err := MintInvoiceRequest(payCallback, amountMsat, mintSecret)
 	if err != nil {
 		return Invoice{}, err
 	}

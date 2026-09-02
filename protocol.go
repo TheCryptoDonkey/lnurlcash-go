@@ -64,13 +64,39 @@ type PayRequest struct {
 	MinSendableMsat int64
 	MaxSendableMsat int64
 	Metadata        string
-	// WithdrawLink is present when paying this mints a bearer note.
+	// WithdrawLink is present when paying this mints a bearer note. It is the
+	// raw LUD-17 withdraw endpoint, in either the plain or the lnurlw://
+	// spelling: the draft says "as described in LUD-17", and LUD-17 describes
+	// both, so a wallet accepts either unchanged.
 	WithdrawLink string
 	MintPubkey   string
 	// MintFee is valid only when HasMintFee is true. Absent means the service
 	// advertised none, which the spec reads as fee-free rather than unknown.
 	MintFee    MintFee
 	HasMintFee bool
+	// CommentAllowed is LUD-12's field and LUD-25's minting capability, valid
+	// only when HasCommentAllowed is true. A mint must allow the 64 characters
+	// a hex-encoded SHA-256 commitment needs.
+	CommentAllowed    int64
+	HasCommentAllowed bool
+	// MintToHash is an additive ForgeSworn extension: the service also accepts
+	// the same commitment as an h parameter. Never a substitute for the
+	// mandatory comment, and anything that is not exactly true reads as false.
+	MintToHash bool
+}
+
+// MintCommentLength is the exact comment capacity minting needs: 32 bytes as
+// lowercase hex.
+const MintCommentLength = 64
+
+// NamesMintOutput reports whether this service can mint a current-draft LUD-25
+// note.
+//
+// MintToHash alone cannot stand in for it: that extension is additive and
+// predates the comment spelling, and a service without the comment capacity has
+// nowhere to put the commitment.
+func (p PayRequest) NamesMintOutput() bool {
+	return p.HasCommentAllowed && p.CommentAllowed >= MintCommentLength
 }
 
 // Invoice is a payRequest callback's answer.
@@ -452,25 +478,110 @@ func ParsePayRequest(body []byte) (PayRequest, error) {
 	minSendable, _ := msat(parsed, "minSendable")
 	maxSendable, _ := msat(parsed, "maxSendable")
 	fee, hasFee := ParseMintFee(metadata)
-	return PayRequest{
-		Callback:        str(parsed, "callback"),
-		MinSendableMsat: minSendable,
-		MaxSendableMsat: maxSendable,
-		Metadata:        metadata,
-		WithdrawLink:    str(parsed, "withdrawLink"),
-		MintPubkey:      str(parsed, "mintPubkey"),
-		MintFee:         fee,
-		HasMintFee:      hasFee,
-	}, nil
+	// A withdrawLink that is present but not a string is a broken mint, not a
+	// mint without one. Reading it as absent would send the caller down the
+	// well-known fallback and quietly mint against the wrong endpoint.
+	if raw, present := parsed["withdrawLink"]; present {
+		if _, ok := raw.(string); !ok {
+			return PayRequest{}, &ProtocolError{Detail: "the mint's payRequest has an invalid withdrawLink"}
+		}
+	}
+	withdrawLink := str(parsed, "withdrawLink")
+	commentAllowed, hasCommentAllowed := msat(parsed, "commentAllowed")
+	mintToHash, _ := parsed["mintToHash"].(bool)
+	request := PayRequest{
+		Callback:          str(parsed, "callback"),
+		MinSendableMsat:   minSendable,
+		MaxSendableMsat:   maxSendable,
+		Metadata:          metadata,
+		WithdrawLink:      withdrawLink,
+		MintPubkey:        str(parsed, "mintPubkey"),
+		MintFee:           fee,
+		HasMintFee:        hasFee,
+		CommentAllowed:    commentAllowed,
+		HasCommentAllowed: hasCommentAllowed,
+		MintToHash:        mintToHash,
+	}
+	// LUD-25: minting is comment-bound. A payRequest that advertises a
+	// withdrawLink but no room for the 64-character commitment is offering
+	// something it cannot deliver, and the failure would otherwise land after
+	// the caller had already paid.
+	if withdrawLink != "" && !request.NamesMintOutput() {
+		return PayRequest{}, &ProtocolError{
+			Detail: "this mint offers no room for the required output commitment - it cannot mint",
+		}
+	}
+	return request, nil
 }
 
-// InvoiceRequest builds the payRequest callback GET for an amount.
+// InvoiceRequest builds a plain LUD-06 callback GET for an amount.
+//
+// Correct for paying an ordinary Lightning address; it mints nothing, because
+// it names no output. To mint, use MintInvoiceRequest.
 func InvoiceRequest(payCallback string, amountMsat int64) (Request, error) {
 	built, err := withParams(payCallback, [][2]string{{"amount", strconv.FormatInt(amountMsat, 10)}})
 	if err != nil {
 		return Request{}, fmt.Errorf("%w: that pay callback does not parse", ErrRequestRefused)
 	}
 	return Request{URL: built}, nil
+}
+
+// MintInvoiceRequestWithHash asks for a mint invoice, naming the note it will
+// credit with h = sha256(secret).
+//
+// LUD-25 carries the commitment as a mandatory LUD-12 comment; h repeats the
+// identical value for services that took the parameter form first. It is never
+// an alternative to the comment.
+//
+// The service learns a hash and nothing else, so the payment preimage is
+// settlement proof only - it can never redeem the note. That is the whole point
+// of the current draft: a preimage propagates to every routing node that
+// forwards the payment, and a note keyed by one is a note they can all spend.
+func MintInvoiceRequestWithHash(payCallback string, amountMsat int64, h string) (Request, error) {
+	h = strings.ToLower(strings.TrimSpace(h))
+	// Refused here rather than sent, so a wallet never pays for a quote the
+	// service was always going to reject.
+	if !IsPreimage(h) {
+		return Request{}, fmt.Errorf("%w: an output commitment must be 32 bytes of hex - no invoice was requested", ErrRequestRefused)
+	}
+	built, err := withParams(payCallback, [][2]string{
+		{"amount", strconv.FormatInt(amountMsat, 10)},
+		{"comment", h},
+		{"h", h},
+	})
+	if err != nil {
+		return Request{}, fmt.Errorf("%w: that pay callback does not parse", ErrRequestRefused)
+	}
+	return Request{URL: built}, nil
+}
+
+// MintInvoiceRequest is MintInvoiceRequestWithHash, generating the commitment
+// from the secret the caller will hold the note by.
+//
+// The secret comes back on Request.NewSecrets. Persist it BEFORE paying the
+// invoice this returns. Paying for a note and then losing its secret is the one
+// way the comment-bound scheme is worse than the preimage one it replaced, and
+// persisting first removes it entirely. Drawing the secret from the seed
+// derivation rather than the CSPRNG makes the note recoverable from birth,
+// without any rotate at all.
+func MintInvoiceRequest(payCallback string, amountMsat int64, mintSecret string) (Request, error) {
+	// Checked before hashing, so a malformed secret is ErrRequestRefused - the
+	// caller's own input, nothing sent - rather than the ProtocolError HashK1
+	// would raise, which in this package's taxonomy accuses the service of a
+	// broken response it never sent.
+	if !IsPreimage(mintSecret) {
+		return Request{}, fmt.Errorf("%w: a note secret must be 32 bytes of hex - no invoice was requested", ErrRequestRefused)
+	}
+	h, err := HashK1(mintSecret)
+	if err != nil {
+		return Request{}, err
+	}
+	request, err := MintInvoiceRequestWithHash(payCallback, amountMsat, h)
+	if err != nil {
+		return Request{}, err
+	}
+	request.NewSecrets = []string{mintSecret}
+	return request, nil
 }
 
 // ParseInvoice reads an invoice, refusing one for the wrong amount.
@@ -501,12 +612,14 @@ func ParseInvoice(body []byte, requestedMsat int64) (Invoice, error) {
 	return Invoice{PR: pr, VerifyURL: str(parsed, "verify"), Disposable: disposable}, nil
 }
 
-// VerifyRequest builds a LUD-21 verify GET.
+// VerifyRequest builds a LUD-21 verify GET, to learn whether a mint or melt has
+// settled.
 //
-// For LNURLcash specifically, a settled invoice's preimage IS the bearer note's
-// spend secret, and a verify GET proves nothing about who is asking - only that
-// they know the payment hash, which travels inside the invoice itself. A caller
-// receiving a preimage here MUST rotate immediately.
+// Under current LUD-25 this is unconditionally safe to call and its answer
+// unconditionally safe to disclose: minting is comment-bound, so the preimage a
+// settled invoice reveals is settlement proof and never the note's credential.
+// (It was not always so. An earlier draft keyed the note by the payment
+// preimage, which made this endpoint hand out the money; that fallback is gone.)
 func VerifyRequest(verifyURL string) (Request, error) {
 	return Request{URL: verifyURL}, nil
 }
