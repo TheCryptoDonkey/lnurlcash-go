@@ -25,6 +25,59 @@ type Request struct {
 	NewSecrets []string
 }
 
+// Policy is what this package insists a service does, rather than merely hopes
+// it does.
+//
+// LUD-25 makes offline verification mandatory: a service MUST publish
+// mintPubkey and MUST sign every note a rotate, split or merge mints. A wallet
+// that quietly accepted unsigned notes would be handing its holder something
+// nobody downstream can check, which is the exact gap offline verification
+// exists to close - so the zero value insists.
+//
+// Set RequireSignatures false only to talk to a service that predates the
+// requirement, and only knowing the cost.
+type Policy struct {
+	// AllowUnsignedNotes turns the requirement off. Named for what it permits
+	// rather than what it demands, so the zero-value Policy is the strict one
+	// and a caller has to say the dangerous thing out loud.
+	AllowUnsignedNotes bool
+}
+
+// RequireSignatures reports whether this policy insists on verifiable notes.
+func (p Policy) RequireSignatures() bool { return !p.AllowUnsignedNotes }
+
+// MutationKind says which mutation a response is being read as, which decides
+// what it must carry. A melt mints nothing, so it has no signature to return
+// and none is required; a split mints two notes and owes one over each.
+type MutationKind int
+
+const (
+	MutationMelt MutationKind = iota
+	MutationRotate
+	MutationSplit
+	MutationMerge
+)
+
+// IsCompressedPubkey reports whether value is a compressed secp256k1 point: 33
+// bytes hex, the leading byte naming which of the two y values the x
+// coordinate stands for.
+//
+// Checked at the response rather than at the first signature check, because a
+// mintPubkey that is not one verifies nothing - and the same fault found later
+// looks like a forged note instead of a broken mint.
+func IsCompressedPubkey(value string) bool {
+	key := strings.ToLower(strings.TrimSpace(value))
+	if len(key) != 66 || (!strings.HasPrefix(key, "02") && !strings.HasPrefix(key, "03")) {
+		return false
+	}
+	for _, r := range key {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return false
+		}
+	}
+	return true
+}
+
 // WithdrawInfo is the informational GET's answer.
 type WithdrawInfo struct {
 	Callback string
@@ -34,7 +87,11 @@ type WithdrawInfo struct {
 	MaxWithdrawableMsat int64
 	MinWithdrawableMsat int64
 	DefaultDescription  string
-	// MintPubkey is present when the service signs its notes.
+	// MintPubkey is the key this service's note signatures verify against.
+	//
+	// LUD-25 makes offline verification mandatory, so a conforming service
+	// always publishes it here. Only ever empty when the caller passed a Policy
+	// with RequireSignatures false.
 	MintPubkey string
 }
 
@@ -197,7 +254,7 @@ func NoteInfoRequest(noteURL string) (Request, error) {
 }
 
 // ParseNoteInfo reads an informational GET's answer.
-func ParseNoteInfo(body []byte, queriedURL string) (WithdrawInfo, error) {
+func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo, error) {
 	parsed, err := decode(body)
 	if err != nil {
 		return WithdrawInfo{}, err
@@ -232,13 +289,24 @@ func ParseNoteInfo(body []byte, queriedURL string) (WithdrawInfo, error) {
 			Detail: "the service echoed back a different k1 than was queried - the note may have been redeemed elsewhere, or the service isn't spec-compliant",
 		}
 	}
+	mintPubkey := str(parsed, "mintPubkey")
+	// Separate from the shape check above, and separately worded: this response
+	// IS a withdrawRequest, it just describes a note nobody can check offline.
+	// Saying "not a withdrawRequest" would send a caller after the wrong fault.
+	if policy.RequireSignatures() && !IsCompressedPubkey(mintPubkey) {
+		detail := "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key"
+		if mintPubkey == "" {
+			detail = "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)"
+		}
+		return WithdrawInfo{}, &ProtocolError{Detail: detail}
+	}
 	return WithdrawInfo{
 		Callback:            callback,
 		K1:                  strings.ToLower(k1),
 		MaxWithdrawableMsat: maximum,
 		MinWithdrawableMsat: minimum,
 		DefaultDescription:  str(parsed, "defaultDescription"),
-		MintPubkey:          str(parsed, "mintPubkey"),
+		MintPubkey:          strings.ToLower(strings.TrimSpace(mintPubkey)),
 	}, nil
 }
 
@@ -427,7 +495,7 @@ func MergeRequest(callback string, k1s []string, newSecret string) (Request, err
 // may have applied the mutation and merely failed to say so. newSecrets are
 // attached to any ambiguous outcome so nothing can lose them between the call
 // and the check.
-func ParseMutation(body []byte, newSecrets []string) (Mutation, error) {
+func ParseMutation(body []byte, newSecrets []string, kind MutationKind, policy Policy) (Mutation, error) {
 	parsed, err := decode(body)
 	if err != nil {
 		var ambiguous *AmbiguousError
@@ -439,7 +507,16 @@ func ParseMutation(body []byte, newSecrets []string) (Mutation, error) {
 	if err := rejectError(parsed); err != nil {
 		var service *ServiceError
 		_ = asService(err, &service)
-		return Mutation{}, classifyNoteError(service.Reason)
+		refusal := classifyNoteError(service.Reason)
+		// A spent-or-unknown refusal from a mutation is also what an
+		// ALREADY-APPLIED mutation looks like at a service that will not replay
+		// a retry, so the secrets go out with it rather than with the stack
+		// frame. A policy refusal burned nothing and carries nothing.
+		var classified *ServiceError
+		if asService(refusal, &classified) && (classified.Spent || classified.Unknown) {
+			classified.NewSecrets = newSecrets
+		}
+		return Mutation{}, refusal
 	}
 	if str(parsed, "status") != "OK" {
 		return Mutation{}, &AmbiguousError{
@@ -447,9 +524,37 @@ func ParseMutation(body []byte, newSecrets []string) (Mutation, error) {
 			NewSecrets: newSecrets,
 		}
 	}
+	signature, changeSignature := str(parsed, "sig"), str(parsed, "sig2")
+	// Every mutation the replay rule covers owes a signature over each note it
+	// mints. The mutation has already landed by the time this is checked -
+	// status was OK - so the refusal carries the caller's secrets out with it,
+	// or enforcing the spec becomes the thing that loses the money.
+	if policy.RequireSignatures() {
+		what := ""
+		switch {
+		case kind == MutationMelt:
+		case signature == "":
+			what = map[MutationKind]string{
+				MutationRotate: "rotate",
+				MutationSplit:  "split",
+				MutationMerge:  "merge",
+			}[kind]
+		case kind == MutationSplit && changeSignature == "":
+			what = "split's change"
+		}
+		if what != "" {
+			return Mutation{}, &UnverifiableError{
+				Detail: fmt.Sprintf(
+					"the service confirmed the %s but returned no signature, so the note it just minted cannot be verified offline. The note exists - keep the secret",
+					what,
+				),
+				NewSecrets: newSecrets,
+			}
+		}
+	}
 	return Mutation{
-		Signature:       str(parsed, "sig"),
-		ChangeSignature: str(parsed, "sig2"),
+		Signature:       signature,
+		ChangeSignature: changeSignature,
 		PR:              str(parsed, "pr"),
 		VerifyURL:       str(parsed, "verify"),
 	}, nil

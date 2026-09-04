@@ -13,6 +13,41 @@ and the adversarial mock mint.
 
 ### Design notes
 
+**Offline verification is mandatory, and this package insists on it.** LUD-25
+stopped treating a note signature as optional: a service MUST publish
+`mintPubkey` and MUST sign every note a rotate, split or merge mints. So
+`ParseNoteInfo` refuses a `withdrawRequest` publishing no `mintPubkey`, or one
+that is not a 33-byte compressed secp256k1 key, and `ParseMutation` returns
+`*UnverifiableError` when a service confirms a mutation without signing it.
+`Policy{AllowUnsignedNotes: true}` opts out; the field is named for what it
+permits so the zero value is the strict one.
+
+That error carries the fresh secrets, and the reason matters: `status` was OK,
+so the mutation LANDED. The note exists at the hash the wallet disclosed and
+that secret is the only key to it, so enforcing the spec must never be the
+thing that strands the money.
+
+**A spent-or-unknown refusal from a mutation carries its secrets too.** At a
+service that has not implemented the replay rule below, a retried mutation is
+answered as an already-spent input - so that refusal is also what a mutation
+the service ALREADY applied looks like. `ServiceError` gained `NewSecrets`, and
+`NewSecrets(err)` reads them off all three families that can carry them. A
+refusal on policy grounds burned nothing and still carries nothing.
+
+**A mutation whose answer was lost is re-sent, and usually completes.** LUD-25
+gained a "Retrying a mutation" section: a service MUST answer a byte-identical
+rotate, split or merge with the success it already returned. That closes the
+hazard this package's `DisableKeepAlives` was working around, so `Client`
+re-sends deliberately - `MutationRetries`, default one extra attempt.
+
+Never a melt, which carries `pr`, is paid asynchronously and has no replay
+guarantee; never a definitive refusal, which is the service's considered
+answer; and the same `Request` goes out each time rather than a rebuilt one,
+because the replay is matched on the k1 set, `h`, `h2` and `amount` - a
+regenerated secret would make the retry a different mutation, and a second real
+burn. Keep-alives stay disabled regardless: a deliberate retry this package
+counts is a different thing from an invisible one it does not.
+
 **Minting is comment-bound, and the payment preimage is only settlement proof.**
 The draft keyed a fresh note by the invoice's payment preimage until 31 August
 2026, when that fallback was removed outright: a preimage propagates to every

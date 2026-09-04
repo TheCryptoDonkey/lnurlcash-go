@@ -9,12 +9,33 @@ go get github.com/TheCryptoDonkey/lnurlcash-go
 Every LNURLcash mutation (rotate/split/merge/melt) is an HTTP GET, but is NOT
 idempotent - the first attempt burns the input note. net/http retries an
 idempotent request sent on a REUSED connection, and a client with no Transport
-uses the process-wide http.DefaultTransport pool. A retried mutation gets
-"already spent" for its second attempt and reports a DEFINITIVE rejection, so
-the caller discards the fresh secret that was the only copy of the note.
+uses the process-wide http.DefaultTransport pool.
 
-NewClient() sets DisableKeepAlives for this reason. A caller-supplied
-*http.Client MUST do the same.
+LUD-25 closed this at the service end: a service MUST answer a byte-identical
+retried rotate/split/merge with the success it already returned, sig and all.
+So Client re-sends a mutation whose answer was lost, on purpose and bounded
+(Client.MutationRetries; 0 means the default of one extra attempt, negative
+turns it off), and a dropped connection usually resolves into a completed
+mutation. NEVER a melt: it carries pr, is paid asynchronously and has no replay
+guarantee. Never a definitive refusal. The SAME Request goes out each time -
+the replay is matched on the k1 set, h, h2 and amount, so a fresh secret would
+make it a different mutation and a second real burn.
+
+NewClient() still sets DisableKeepAlives: a deliberate retry this package
+counts is not the same as an invisible one it does not, and a service that has
+not caught up still answers the second attempt as already spent. A
+caller-supplied *http.Client SHOULD do the same.
+
+## CRITICAL: offline verification is mandatory
+
+A service MUST publish mintPubkey on every withdrawRequest and MUST return sig
+(and sig2 on a split) from every rotate/split/merge. ParseNoteInfo refuses a
+response with no valid mintPubkey; ParseMutation returns *UnverifiableError for
+a confirmed-but-unsigned mutation. That error means the mutation LANDED, so the
+note is REAL - persist NewSecrets(err) before anything else.
+
+Policy{AllowUnsignedNotes: true} opts out, for a service predating the
+requirement. The zero Policy is the strict one.
 
 ## API
 
@@ -37,8 +58,11 @@ DecodeBolt11AmountMsat, IsBolt11Invoice, SameInvoice.
 
 No-I/O protocol layer: RotateRequest / SplitRequest / MergeRequest /
 MeltRequest / NoteInfoRequest / InvoiceRequest / VerifyRequest return
-Request{URL, NewSecrets}; ParseNoteInfo / ParseMutation / ParseInvoice /
+Request{URL, NewSecrets}; ParseNoteInfo(body, queriedURL, Policy) /
+ParseMutation(body, newSecrets, MutationKind, Policy) / ParseInvoice /
 ParseVerify / ParsePayRequest / ParseMintAddress read the body.
+MutationKind is MutationMelt / MutationRotate / MutationSplit / MutationMerge
+and says what the response owes - a melt mints nothing and owes no signature.
 
 Amounts are int64 milli-satoshis everywhere.
 
@@ -49,14 +73,22 @@ errors.Is(err, ErrNotePending)     a melt is in flight - retry, NOT spent
 IsSpent(err)                       authoritative: already burned
 IsUnknownNote(err)                 service does not recognise it
 IsAmbiguous(err)                   outcome UNKNOWN - assume nothing
-NewSecrets(err)                    the secrets an ambiguous mutation carried
-*ProtocolError                     a non-mutating response did not match the spec
+IsUnverifiable(err)                the mutation LANDED unsigned. The note is
+                                   REAL; only its verifiability is missing
+NewSecrets(err)                    the secrets carried by ANY error that could
+                                   describe a mutation the service applied:
+                                   ambiguous, unverifiable, spent or unknown
+*ProtocolError                     a non-mutating response did not match the
+                                   spec, incl. a withdrawRequest with no
+                                   mintPubkey
 
 ## Rules
 
 1. MaxWithdrawableMsat is the ONLY authoritative value; a note URL's amount is a claim.
 2. The wallet generates replacement secrets; never accept a service-supplied k1.
-3. On IsAmbiguous: persist NewSecrets(err) FIRST, then ProbeBurnedNote.
+3. On ANY error from a mutation: persist NewSecrets(err) FIRST, then
+   ProbeBurnedNote. Not just IsAmbiguous - a spent/unknown refusal and an
+   unverifiable one carry them too.
 4. A melt's success means IN FLIGHT. ErrNotePending means retry, not spent.
 5. Rotate immediately after claiming a minted note.
 6. Never log note URLs - the secret is in the query string.

@@ -16,24 +16,57 @@ HTTP considers GET idempotent, so a transport may resend one when a connection
 fails mid-flight. An LNURLcash mutation is emphatically *not* idempotent: the
 first attempt burns the input note.
 
-So when a service applies a rotate and the connection then drops, a retrying
-transport sends it again, gets `"invalid or already spent k1"` for the second
-attempt, and the caller sees a **definitive rejection**. It concludes nothing
-happened and discards the fresh secret — which was the only copy of the note
-the service just minted.
+For most of this draft's life that was fatal. A service applied a rotate, the
+connection dropped, a retrying transport sent it again, and the second attempt
+got `"invalid or already spent k1"` — a **definitive rejection**. The caller
+concluded nothing had happened and discarded the fresh secret, which was the
+only copy of the note the service had just minted.
 
-`net/http` does exactly this, under a condition that is easy to miss: it
+`net/http` does exactly that resend, under a condition that is easy to miss: it
 retries an idempotent request that was sent on a **reused** connection. A
 client with no `Transport` of its own uses `http.DefaultTransport`, whose
-connection pool is shared process-wide — so whether your mutation is silently
-retried depends on whether some unrelated code happened to talk to the same
-host first.
+connection pool is shared process-wide — so whether your mutation was silently
+retried depended on whether some unrelated code happened to talk to the same
+host first. This package found it by running against a mock mint that hangs up
+mid-mutation, and failed two tests until the transport changed.
 
-`NewClient` therefore sets `DisableKeepAlives`, which removes the only
-condition under which `net/http` retries. **If you supply your own
-`*http.Client`, do the same.** This was found by running the package against a
-mock mint that hangs up mid-mutation, and it failed two tests until the
-transport changed.
+**LUD-25 has since closed the hole at the other end.** A service MUST now
+answer a byte-identical rotate, split or merge with the success it already
+returned, signature and all, rather than with the already-spent refusal. So
+`Client` re-sends a mutation whose answer was lost — deliberately, bounded, and
+never a melt — and a dropped connection usually resolves into a completed
+mutation instead of an unresolved maybe:
+
+```go
+// the connection dropped after the mint applied this. It completes anyway.
+rotated, err := client.RotateNote(ctx, callback, oldK1)
+```
+
+`MutationRetries` sets how many extra attempts (zero means the default of one;
+negative turns it off). Only rotate, split and merge — never a melt, which
+carries `pr`, is paid asynchronously and has no replay guarantee — and only an
+ambiguous failure, never a refusal the service actually considered. The
+re-sent request is byte-identical, because the replay is matched on the k1 set,
+`h`, `h2` and `amount`.
+
+`NewClient` still sets `DisableKeepAlives`. A deliberate retry this package
+counts is a different thing from an invisible one it does not, a service that
+has not caught up still answers the second attempt as already spent, and a
+fresh connection per request is not a cost worth weighing against leaving that
+to chance. **If you supply your own `*http.Client`, do the same.**
+
+## Offline verification is mandatory
+
+A service MUST publish `mintPubkey` and MUST sign every note a rotate, split or
+merge mints. `ParseNoteInfo` refuses a `withdrawRequest` publishing no valid
+one, and a mutation the service confirms but does not sign returns
+`*UnverifiableError` — which **carries the fresh secrets**, because the
+mutation landed and the note it minted is real. Read them with `NewSecrets`
+and persist them before anything else.
+
+`Policy{AllowUnsignedNotes: true}` opts out for a service that predates the
+requirement. The zero value is the strict one, so a caller has to say the
+dangerous thing out loud.
 
 ## Usage
 

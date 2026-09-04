@@ -30,9 +30,40 @@ type Client struct {
 
 	// Secrets supplies replacement note secrets. Nil means the OS CSPRNG.
 	Secrets SecretSource
+
+	// Policy is what this client insists a service does. The zero value
+	// requires the offline verification LUD-25 makes mandatory.
+	Policy Policy
+
+	// MutationRetries is how many times to re-send a rotate, split or merge
+	// whose outcome the transport lost.
+	//
+	// LUD-25 requires a service to answer a byte-identical retry with the
+	// original success ("Retrying a mutation"), so re-sending resolves the
+	// ambiguity rather than compounding it: a conforming service replays, and
+	// one that refuses leaves the caller exactly where an un-retried failure
+	// would have.
+	//
+	// Never applied to a melt, which carries pr, is paid out asynchronously and
+	// has no replay guarantee at all. Zero means the DEFAULT of one attempt
+	// beyond the first; use a negative number to turn retrying off entirely,
+	// so the zero value of a bare Client behaves like NewClient.
+	MutationRetries int
 }
 
-// NewClient returns a Client whose HTTP transport will not silently retry.
+// mutationRetries resolves the field's zero value to the default.
+func (c *Client) mutationRetries() int {
+	if c.MutationRetries < 0 {
+		return 0
+	}
+	if c.MutationRetries == 0 {
+		return 1
+	}
+	return c.MutationRetries
+}
+
+// NewClient returns a Client that retries a mutation deliberately, and whose
+// HTTP transport will not do it behind the client's back.
 //
 // This is the most important thing in this file, and it is worth saying why in
 // full.
@@ -42,23 +73,32 @@ type Client struct {
 // fails mid-flight. An LNURLcash mutation is emphatically not idempotent: the
 // first attempt burns the input note.
 //
-// So when a service applies a rotate and the connection then drops, a retrying
-// transport sends it again, gets "invalid or already spent k1" for the second
-// attempt, and the caller sees a definitive rejection. It concludes nothing
-// happened and discards the fresh secret - which was the only copy of the note
-// the service just minted. The money is gone, and every layer behaved
-// reasonably.
+// For most of this draft's life that was fatal. A service applied a rotate, the
+// connection dropped, a retrying transport sent it again, and the second
+// attempt got "invalid or already spent k1" - a definitive rejection. The
+// caller concluded nothing had happened and discarded the fresh secret, which
+// was the only copy of the note the service had just minted. The money was
+// gone, and every layer had behaved reasonably.
 //
-// Go's net/http does exactly this, under a condition that is easy to miss: it
-// retries an idempotent request when it was sent on a REUSED connection. A
-// client with no Transport of its own uses http.DefaultTransport, whose
-// connection pool is shared process-wide - so whether a mutation is silently
-// retried depends on whether some unrelated code happened to talk to the same
-// host first. That is not a property to leave to chance with somebody's money.
+// Go's net/http does exactly that resend, under a condition that is easy to
+// miss: it retries an idempotent request when it was sent on a REUSED
+// connection. A client with no Transport of its own uses
+// http.DefaultTransport, whose connection pool is shared process-wide - so
+// whether a mutation was silently retried depended on whether some unrelated
+// code happened to talk to the same host first.
 //
-// Disabling keep-alives removes the only condition under which net/http
-// retries. The cost is a fresh connection per request, which for a wallet
-// making a handful of them is not a cost worth weighing against this.
+// LUD-25 closed the hole at the other end: a service MUST now answer a
+// byte-identical rotate, split or merge with the success it already returned,
+// signature and all. So this client re-sends one whose answer was lost, on
+// purpose and bounded, and a lost answer usually resolves into a completed
+// mutation. See MutationRetries.
+//
+// Keep-alives stay disabled all the same. A deliberate retry this package
+// counts is a different thing from an invisible one it does not, a service that
+// has not caught up still answers the second attempt as already spent, and the
+// cost - a fresh connection per request, for a wallet making a handful of them
+// - is not worth weighing against leaving that to chance with somebody's
+// money.
 func NewClient() *Client {
 	return &Client{
 		HTTP: &http.Client{
@@ -157,7 +197,7 @@ func (c *Client) FetchNoteInfo(ctx context.Context, noteURL string) (WithdrawInf
 	if err != nil {
 		return WithdrawInfo{}, err
 	}
-	return ParseNoteInfo(body, noteURL)
+	return ParseNoteInfo(body, noteURL, c.Policy)
 }
 
 // FetchMintAddress performs the experimental mint-address GET.
@@ -173,15 +213,45 @@ func (c *Client) FetchMintAddress(ctx context.Context, rawURL string) (MintAddre
 	return ParseMintAddress(body)
 }
 
-func (c *Client) mutate(ctx context.Context, request Request, err error) (Mutation, error) {
+// mutate performs one mutating GET, re-sending it while the transport keeps
+// losing the answer.
+//
+// LUD-25's "Retrying a mutation" is what makes this safe and what makes it
+// useful: a service MUST answer a byte-identical rotate, split or merge with
+// the success it returned the first time, rather than with the already-spent
+// refusal its burned inputs would otherwise earn.
+//
+// The same Request goes out each time rather than a rebuilt one, because the
+// replay is matched on the k1 set, h, h2 and amount. Regenerating a secret
+// between attempts would make the retry a DIFFERENT mutation, and against a
+// service that had already applied the first, a second real burn.
+//
+// Only ambiguity is retried. A definitive refusal is the service's considered
+// answer and asking again cannot improve it. A melt is never retried at all.
+func (c *Client) mutate(ctx context.Context, request Request, err error, kind MutationKind) (Mutation, error) {
 	if err != nil {
 		return Mutation{}, err
 	}
-	body, err := c.do(ctx, request)
-	if err != nil {
-		return Mutation{}, err
+	attempts := c.mutationRetries()
+	if kind == MutationMelt {
+		attempts = 0
 	}
-	return ParseMutation(body, request.NewSecrets)
+	var lost error
+	for attempt := 0; attempt <= attempts; attempt++ {
+		body, err := c.do(ctx, request)
+		if err == nil {
+			var mutation Mutation
+			mutation, err = ParseMutation(body, request.NewSecrets, kind, c.Policy)
+			if err == nil {
+				return mutation, nil
+			}
+		}
+		if !IsAmbiguous(err) {
+			return Mutation{}, err
+		}
+		lost = err
+	}
+	return Mutation{}, lost
 }
 
 // MeltNote burns a note; the service pays pr of exactly its value.
@@ -189,7 +259,7 @@ func (c *Client) mutate(ctx context.Context, request Request, err error) (Mutati
 // Success means the payment is IN FLIGHT, not that the note is spent.
 func (c *Client) MeltNote(ctx context.Context, callback, k1, pr string) (Mutation, error) {
 	request, err := MeltRequest(callback, k1, pr)
-	return c.mutate(ctx, request, err)
+	return c.mutate(ctx, request, err, MutationMelt)
 }
 
 // RotatedNote is a note this wallet now holds, whose secret the service has
@@ -217,7 +287,7 @@ func (c *Client) RotateNote(ctx context.Context, callback, k1 string) (RotatedNo
 		return RotatedNote{}, err
 	}
 	request, err := RotateRequest(callback, k1, fresh)
-	mutation, err := c.mutate(ctx, request, err)
+	mutation, err := c.mutate(ctx, request, err, MutationRotate)
 	if err != nil {
 		return RotatedNote{}, err
 	}
@@ -236,7 +306,7 @@ func (c *Client) SplitNote(ctx context.Context, callback string, k1s []string, a
 		return SplitNotes{}, err
 	}
 	request, err := SplitRequest(callback, k1s, amountMsat, fresh, change)
-	mutation, err := c.mutate(ctx, request, err)
+	mutation, err := c.mutate(ctx, request, err, MutationSplit)
 	if err != nil {
 		return SplitNotes{}, err
 	}
@@ -255,7 +325,7 @@ func (c *Client) MergeNotes(ctx context.Context, callback string, k1s []string) 
 		return RotatedNote{}, err
 	}
 	request, err := MergeRequest(callback, k1s, fresh)
-	mutation, err := c.mutate(ctx, request, err)
+	mutation, err := c.mutate(ctx, request, err, MutationMerge)
 	if err != nil {
 		return RotatedNote{}, err
 	}
