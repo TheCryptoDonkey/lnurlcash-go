@@ -40,6 +40,9 @@ import (
 //	AmbiguousError      the outcome is unknown. The request MAY have been
 //	                    processed. Nothing may be assumed either way.
 //	ProtocolError       a non-mutating response did not match the spec.
+//	UnverifiableError   a MUTATION landed and the service returned no signature
+//	                    over it. The note exists; it just cannot be verified
+//	                    offline.
 //
 // Treating an ambiguous failure as a definitive one is how wallets lose money:
 // a rotate that times out after the service burned the input has already
@@ -79,6 +82,17 @@ type ServiceError struct {
 	// Unknown is true when the service does not recognise the k1 at all.
 	// Distinct from Spent: nothing here proves the holder's copy was ever real.
 	Unknown bool
+	// NewSecrets are the fresh wallet-generated secrets a MUTATION disclosed
+	// the hashes of, when this refusal is one that could describe a mutation
+	// the service had already applied.
+	//
+	// At a service that has not implemented LUD-25's replay rule, a retried
+	// rotate, split or merge is answered as an already-spent input - so a Spent
+	// or Unknown refusal from a mutation is also what a mutation the service
+	// DID apply looks like. Read these with NewSecrets before believing it.
+	//
+	// Nil on every other refusal, and on every non-mutating call.
+	NewSecrets []string
 }
 
 func (e *ServiceError) Error() string {
@@ -116,6 +130,36 @@ func (e *AmbiguousError) Error() string { return e.Detail }
 
 func (e *AmbiguousError) Unwrap() error { return e.Cause }
 
+// UnverifiableError means the service confirmed a rotate, split or merge with
+// {"status":"OK"} but returned no signature over the hash it was given. LUD-25
+// makes offline verification mandatory, so this is a non-conforming service -
+// but the mutation LANDED. The note exists, at the hash the caller disclosed,
+// and the wallet-generated secret behind it is the only key to that value
+// anywhere.
+//
+// So this is an error about the note's VERIFIABILITY, never about its
+// existence, and it carries the secrets for the same reason AmbiguousError
+// does: refusing without them would strand real money to make a point about
+// conformance. Persist them, then decide whether to keep dealing with a mint
+// that issues notes nobody can check.
+//
+// Only ever raised when RequireSignatures is on, which is the default.
+type UnverifiableError struct {
+	Detail string
+	// NewSecrets, as AmbiguousError - and more important here, because the note
+	// is known to exist.
+	NewSecrets []string
+}
+
+func (e *UnverifiableError) Error() string { return e.Detail }
+
+// IsUnverifiable reports whether a mutation landed unsigned. The note is real;
+// only its offline verifiability is missing.
+func IsUnverifiable(err error) bool {
+	var unverifiable *UnverifiableError
+	return errors.As(err, &unverifiable)
+}
+
 // IsAmbiguous reports whether the request could have been processed. The single
 // most important question about any failure here.
 func IsAmbiguous(err error) bool {
@@ -123,12 +167,24 @@ func IsAmbiguous(err error) bool {
 	return errors.As(err, &ambiguous)
 }
 
-// NewSecrets returns the fresh secrets carried out of an ambiguous mutation.
-// Persist them before doing anything else.
+// NewSecrets returns the fresh secrets carried out of any error that could
+// describe a mutation the service applied: ambiguous, unverifiable, or a
+// spent-or-unknown refusal. Persist them before doing anything else.
 func NewSecrets(err error) []string {
 	var ambiguous *AmbiguousError
 	if errors.As(err, &ambiguous) {
 		return ambiguous.NewSecrets
+	}
+	var unverifiable *UnverifiableError
+	if errors.As(err, &unverifiable) {
+		return unverifiable.NewSecrets
+	}
+	// A refusal on policy grounds burned nothing, so it carries nothing and a
+	// caller may discard its staged records at once. Only spent and unknown can
+	// be a description of something that DID happen.
+	var service *ServiceError
+	if errors.As(err, &service) && (service.Spent || service.Unknown) {
+		return service.NewSecrets
 	}
 	return nil
 }

@@ -534,11 +534,124 @@ func TestFindsTheExperimentalMintAddress(t *testing.T) {
 	}
 }
 
+// ---- mandatory offline verification ----
+
+// LUD-25 stopped treating a note signature as optional, so a service that
+// issues none is non-conforming rather than merely basic. The refusal has to be
+// the loud kind - but the rotate LANDED, and the fresh secret is the only key
+// to the note it minted, so the error carries it out. Refusing without it would
+// be this package destroying real money to make a point about conformance.
+func TestAnUnsignedRotateIsRefusedWithoutLosingTheNote(t *testing.T) {
+	mint := startMint(t, "--signatures=false")
+	client := lnurlcash.NewClient()
+	k1 := secret(30)
+	mint.credit(t, k1, 21000)
+
+	_, err := client.RotateNote(ctx(t), mint.callback(), k1)
+	if !lnurlcash.IsUnverifiable(err) {
+		t.Fatalf("want an unverifiable outcome, got %v", err)
+	}
+	kept := lnurlcash.NewSecrets(err)
+	if len(kept) != 1 {
+		t.Fatalf("carried %d secrets, want 1", len(kept))
+	}
+	// the note the caller was refused is real, outstanding, and reachable with
+	// nothing but the secret the error handed back
+	if state := mint.noteState(t, kept[0]); state != "outstanding" {
+		t.Fatalf("the refused note is %s, want outstanding", state)
+	}
+}
+
+// The same mint, for a caller who has decided to deal with it anyway. One
+// field, and the note comes back unsigned - which is what it is.
+func TestAnUnsignedServiceStillWorksWhenTheCallerOptsOut(t *testing.T) {
+	mint := startMint(t, "--signatures=false")
+	client := lnurlcash.NewClient()
+	client.Policy = lnurlcash.Policy{AllowUnsignedNotes: true}
+	k1 := secret(31)
+	mint.credit(t, k1, 21000)
+
+	info, err := client.FetchNoteInfo(ctx(t), mint.noteURL(k1))
+	if err != nil {
+		t.Fatalf("info: %v", err)
+	}
+	rotated, err := client.RotateNote(ctx(t), info.Callback, k1)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if rotated.Signature != "" {
+		t.Fatalf("an unsigned service returned a signature: %q", rotated.Signature)
+	}
+	if state := mint.noteState(t, rotated.K1); state != "outstanding" {
+		t.Fatalf("rotated note is %s", state)
+	}
+}
+
+// ---- a mutation the transport retried ----
+
+// The mutation landed and the answer was lost on the way back. LUD-25 now
+// requires the service to answer the identical request with the success it
+// already gave, so asking a second time turns this from an unresolved maybe
+// into a completed rotate - the caller never sees an error at all.
+func TestALostRotateCompletesByAskingAgain(t *testing.T) {
+	mint := startMint(t, "--dropAfterMutation=true")
+	client := lnurlcash.NewClient()
+	k1 := secret(32)
+	mint.credit(t, k1, 21000)
+
+	rotated, err := client.RotateNote(ctx(t), mint.callback(), k1)
+	if err != nil {
+		t.Fatalf("the retry did not resolve the rotate: %v", err)
+	}
+	if state := mint.noteState(t, k1); state != "burned" {
+		t.Fatalf("input state = %s", state)
+	}
+	// the replay repeats the signature, so a note recovered this way is as
+	// verifiable as one whose first answer arrived
+	if rotated.Signature == "" {
+		t.Fatal("the replayed success carried no signature")
+	}
+	info, err := client.FetchNoteInfo(ctx(t), mint.noteURL(rotated.K1))
+	if err != nil || info.MaxWithdrawableMsat != 21000 {
+		t.Fatalf("the rotated note is not there: %d (%v)", info.MaxWithdrawableMsat, err)
+	}
+}
+
+// A service that has not implemented the replay rule answers the second attempt
+// as an already-spent input, exactly as before. The package cannot tell that
+// from a genuine double spend - at the wire they are the same answer - so it
+// hands the secrets back rather than a verdict.
+func TestAMintThatWillNotReplayStillHandsTheSecretsBack(t *testing.T) {
+	mint := startMint(t, "--dropAfterMutation=true", "--retriedMutation=refuse")
+	client := lnurlcash.NewClient()
+	k1 := secret(33)
+	mint.credit(t, k1, 21000)
+
+	_, err := client.RotateNote(ctx(t), mint.callback(), k1)
+	rescued := lnurlcash.NewSecrets(err)
+	if len(rescued) != 1 {
+		t.Fatalf("carried %d secrets, want 1 (err %v)", len(rescued), err)
+	}
+	if state := mint.noteState(t, rescued[0]); state != "outstanding" {
+		t.Fatalf("the rescued note is %s, want outstanding", state)
+	}
+}
+
 // ---- ambiguous outcomes ----
+
+// A client that gives up on the first ambiguous answer, as every client did
+// before LUD-25 required a service to replay a retried mutation. The tests that
+// assert what an unresolved mutation carries need it: with retries on, a
+// conforming mint simply answers again and there is nothing left to carry.
+func noRetryClient() *lnurlcash.Client {
+	client := lnurlcash.NewClient()
+	client.MutationRetries = -1
+	return client
+}
 
 func TestALostRotatePreservesItsFreshSecret(t *testing.T) {
 	mint := startMint(t, "--dropAfterMutation=true")
-	client := lnurlcash.NewClient()
+	client := noRetryClient()
 	k1 := secret(16)
 	mint.credit(t, k1, 21000)
 
@@ -563,7 +676,7 @@ func TestALostRotatePreservesItsFreshSecret(t *testing.T) {
 
 func TestALostSplitPreservesBothSecretsInOutputOrder(t *testing.T) {
 	mint := startMint(t, "--dropAfterMutation=true")
-	client := lnurlcash.NewClient()
+	client := noRetryClient()
 	k1 := secret(17)
 	mint.credit(t, k1, 21000)
 
@@ -610,7 +723,7 @@ func TestALiveNoteProbesAsLiveAndAnOfflineProbeKnowsNothing(t *testing.T) {
 
 func TestA200ThatConfirmsNothingIsAmbiguous(t *testing.T) {
 	mint := startMint(t, "--unconfirmedMutation=true")
-	client := lnurlcash.NewClient()
+	client := noRetryClient()
 	k1 := secret(20)
 	mint.credit(t, k1, 21000)
 
