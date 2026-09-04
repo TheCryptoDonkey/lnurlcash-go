@@ -1,6 +1,7 @@
 package lnurlcash
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -54,4 +55,40 @@ func IsPreimage(value string) bool {
 		}
 	}
 	return true
+}
+
+// ---- the legacy derivation ----
+//
+// This project shipped this scheme before LUD-25 had a section on deriving
+// note secrets at all:
+//
+//	root = HMAC-SHA256(key = utf8("lnurlcash-note-v1"), msg = seed)
+//	k1_i = HMAC-SHA256(key = root,                      msg = utf8(host + ":" + index))
+//
+// It is NOT what a new wallet should mint under - see cash.go for the scheme
+// the draft actually specifies. It is here because notes minted under it are
+// still money, and a restore that walked only the current scheme would leave
+// them at a mint it can no longer name.
+
+const noteDerivationDomain = "lnurlcash-note-v1"
+
+// DeriveNoteRoot returns the legacy scheme's root. seed is raw bytes, of any
+// length.
+func DeriveNoteRoot(seed []byte) [32]byte {
+	mac := hmac.New(sha256.New, []byte(noteDerivationDomain))
+	mac.Write(seed)
+	var root [32]byte
+	copy(root[:], mac.Sum(nil))
+	return root
+}
+
+// DeriveNoteSecret returns the legacy scheme's i-th secret at host, as 32
+// bytes of hex.
+//
+// host is the mint host as the wallet stores it - lowercase, port included
+// where there is one - and index is decimal ASCII counting from 0.
+func DeriveNoteSecret(root [32]byte, host string, index uint32) string {
+	mac := hmac.New(sha256.New, root[:])
+	fmt.Fprintf(mac, "%s:%d", host, index)
+	return hex.EncodeToString(mac.Sum(nil))
 }

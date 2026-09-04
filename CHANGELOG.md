@@ -5,6 +5,25 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Seed-recoverable note secrets, and the private lookup a restore needs
+
+- `cash.go`: LUD-25's `m/139'` scheme. `DeriveCashRoot`,
+  `DeriveCashDomainNode`, `DeriveCashSecret`, `CashSecretAt`,
+  `CashDomainIndices`, `CashNodeToHex`/`FromHex`, `DeriveCashChild` and
+  `CashSecretSource`. `d1..d4` are raw uint32 used exactly as they fall,
+  hardened only where they land at or above 2^31; masking the top bit or
+  hardening all four derives a different tree from every conforming wallet.
+- `DeriveNoteRoot` / `DeriveNoteSecret`: the pre-spec HMAC scheme, so notes
+  minted under it stay findable. Not what to mint under.
+- `BuildNoteInfoURLByHash` and `ParseNoteInfoByHash`: LUD-25's `?h=`
+  informational GET. A restore walk queries a whole gap window of indices the
+  wallet has not minted into yet, so asking by secret publishes exactly the
+  secrets it is about to mint under.
+- Graded against `lnurlcash-conformance` 0.7.0's `cash-derivation.json` and
+  `derivation.json`, including BIP-32's own published test vector 1.
+- `btcec` and `decred/secp256k1` move from indirect to direct requirements;
+  both were already compiled in for signature verification.
+
 First release. A Go implementation of LNURLcash, following the protocol layer
 of dni's [lnurl-wallet](https://github.com/dni/lnurl-wallet) and checked against
 the shared

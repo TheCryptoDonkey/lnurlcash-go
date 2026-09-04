@@ -5,6 +5,7 @@ package lnurlcash_test
 // this file states what the protocol is - the vectors do.
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -590,6 +591,155 @@ func TestPayRequestVectors(t *testing.T) {
 	for _, testCase := range verify.Rejected {
 		if _, err := lnurlcash.ParseVerify(testCase.Body); err == nil {
 			t.Errorf("%s: must not parse", testCase.Name)
+		}
+	}
+}
+
+// ---- derivation ----
+//
+// The two schemes a wallet may mint under. cash-derivation.json is the one
+// LUD-25 specifies and the one a new wallet uses; derivation.json is the
+// pre-spec HMAC scheme, kept because notes minted under it are still money.
+//
+// A disagreement with either file is a wallet that cannot restore what another
+// implementation of the same seed phrase minted, which is the whole reason
+// these vectors exist rather than each library testing itself.
+
+func TestCashDerivationVectors(t *testing.T) {
+	vectors := loadVectors(t, "cash-derivation.json")
+
+	var scheme struct {
+		Purpose                 string `json:"purpose"`
+		HardenedByMagnitudeOnly bool   `json:"hardenedByMagnitudeOnly"`
+	}
+	unmarshalInto(t, vectors["scheme"], &scheme)
+	if scheme.Purpose != "m/139'" {
+		t.Fatalf("the vector describes %q, not the scheme this package implements", scheme.Purpose)
+	}
+	// The one thing an implementation can silently get wrong: d1..d4 are raw
+	// uint32, hardened only where they happen to land at or above 2^31.
+	if !scheme.HardenedByMagnitudeOnly {
+		t.Fatal("the vector no longer pins hardened-by-magnitude-only")
+	}
+
+	// BIP-32's own published vector 1, so a failure here says CKDpriv is wrong
+	// rather than the LUD-25 path above it. The chain alternates hardened and
+	// unhardened, which is exactly the pair of legs the domain levels land on.
+	var steps []struct {
+		Index *uint32 `json:"index"`
+		Node  string  `json:"node"`
+	}
+	unmarshalInto(t, vectors["bip32Vector1"], &steps)
+	node, err := lnurlcash.CashNodeFromHex(steps[0].Node)
+	if err != nil {
+		t.Fatalf("BIP-32 vector 1 master: %v", err)
+	}
+	for _, step := range steps[1:] {
+		if node, err = lnurlcash.DeriveCashChild(node, *step.Index); err != nil {
+			t.Fatalf("BIP-32 vector 1 at %d: %v", *step.Index, err)
+		}
+		if got := lnurlcash.CashNodeToHex(node); got != step.Node {
+			t.Errorf("BIP-32 vector 1 at %d: %s, want %s", *step.Index, got, step.Node)
+		}
+	}
+
+	var cases []struct {
+		Name          string   `json:"name"`
+		SeedHex       string   `json:"seedHex"`
+		Host          string   `json:"host"`
+		Index         uint32   `json:"index"`
+		CashRoot      string   `json:"cashRoot"`
+		DomainIndices []uint32 `json:"domainIndices"`
+		DomainNode    string   `json:"domainNode"`
+		K1            string   `json:"k1"`
+		NoteID        string   `json:"noteId"`
+	}
+	unmarshalInto(t, vectors["cases"], &cases)
+	for _, testCase := range cases {
+		seed, err := hex.DecodeString(testCase.SeedHex)
+		if err != nil {
+			t.Fatalf("%s: seedHex: %v", testCase.Name, err)
+		}
+		root, err := lnurlcash.DeriveCashRoot(seed)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		if got := lnurlcash.CashNodeToHex(root); got != testCase.CashRoot {
+			t.Errorf("%s: root = %s, want %s", testCase.Name, got, testCase.CashRoot)
+		}
+
+		indices, err := lnurlcash.CashDomainIndices(root, testCase.Host)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		for i, want := range testCase.DomainIndices {
+			if indices[i] != want {
+				t.Errorf("%s: d%d = %d, want %d", testCase.Name, i+1, indices[i], want)
+			}
+		}
+
+		domainNode, err := lnurlcash.DeriveCashDomainNode(root, testCase.Host)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		if got := lnurlcash.CashNodeToHex(domainNode); got != testCase.DomainNode {
+			t.Errorf("%s: domain node = %s, want %s", testCase.Name, got, testCase.DomainNode)
+		}
+
+		secret, err := lnurlcash.DeriveCashSecret(root, testCase.Host, testCase.Index)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		if secret != testCase.K1 {
+			t.Errorf("%s: k1 = %s, want %s", testCase.Name, secret, testCase.K1)
+		}
+		// The hardware-signer path: given only this mint's subtree, with no
+		// seed and no elliptic curve, every note index still resolves.
+		fromNode, err := lnurlcash.CashSecretAt(domainNode, testCase.Index)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		if fromNode != testCase.K1 {
+			t.Errorf("%s: from the domain node alone = %s, want %s", testCase.Name, fromNode, testCase.K1)
+		}
+		id, err := lnurlcash.HashK1(secret)
+		if err != nil {
+			t.Fatalf("%s: %v", testCase.Name, err)
+		}
+		if id != testCase.NoteID {
+			t.Errorf("%s: noteId = %s, want %s", testCase.Name, id, testCase.NoteID)
+		}
+	}
+}
+
+func TestLegacyDerivationVectors(t *testing.T) {
+	vectors := loadVectors(t, "derivation.json")
+
+	var scheme struct {
+		RootKey string `json:"rootKey"`
+	}
+	unmarshalInto(t, vectors["scheme"], &scheme)
+	if scheme.RootKey != "lnurlcash-note-v1" {
+		t.Fatalf("the vector describes %q, not the legacy scheme", scheme.RootKey)
+	}
+
+	var cases []struct {
+		Name    string `json:"name"`
+		SeedHex string `json:"seedHex"`
+		Host    string `json:"host"`
+		Index   uint32 `json:"index"`
+		K1      string `json:"k1"`
+		NoteID  string `json:"noteId"`
+	}
+	unmarshalInto(t, vectors["cases"], &cases)
+	for _, testCase := range cases {
+		seed, err := hex.DecodeString(testCase.SeedHex)
+		if err != nil {
+			t.Fatalf("%s: seedHex: %v", testCase.Name, err)
+		}
+		root := lnurlcash.DeriveNoteRoot(seed)
+		if got := lnurlcash.DeriveNoteSecret(root, testCase.Host, testCase.Index); got != testCase.K1 {
+			t.Errorf("%s: k1 = %s, want %s", testCase.Name, got, testCase.K1)
 		}
 	}
 }

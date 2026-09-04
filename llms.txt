@@ -50,6 +50,26 @@ client.SettleNote(ctx, baseURL, k1, expectedMsat, sig) (SettledNote, error)
 client.ProbeBurnedNote(ctx, url) NoteFate    // NoteLive | NoteGone | NoteFateUnknown
 client.FetchPayRequest / RequestInvoice / FetchInvoiceStatus / FetchMintAddress
 
+DeriveCashRoot(seed) -> CashNode              LUD-25's scheme, BIP-32 m/139'
+DeriveCashDomainNode(root, host) -> CashNode  m/139'/d1/d2/d3/d4, d1..d4 =
+  HMAC-SHA256(privkey at m/139'/0, host)[0..16] as 4 RAW big-endian uint32.
+  RAW: BIP-32 reads >= 2^31 as hardened, so ~half the levels are, decided by
+  the host name. NEVER mask the top bit, NEVER harden all four - either
+  derives a different tree and restores nothing, silently.
+DeriveCashSecret(root, host, i) / CashSecretAt(domainNode, i)
+  no unhardened level below the domain node, so a signer given the node needs
+  no curve - which is why the node is its own step
+CashNodeToHex / CashNodeFromHex   privateKey || chainCode, 64 bytes
+DeriveCashChild(node, rawUint32)  BIP-32 CKDpriv, for checking this package
+  against BIP-32's own vectors
+NewCashSecretSource(root, host, start).Next() / .NextIndex()
+DeriveNoteRoot / DeriveNoteSecret  LEGACY pre-spec HMAC scheme. Do not mint
+  under it; still scanned so old notes stay findable.
+BuildNoteInfoURLByHash(withdrawLink, h) + ParseNoteInfoByHash(body, policy)
+  the ?h= informational GET, so a restore walk keeps secrets off the wire.
+  A rejection proves nothing: unsupported, unknown and BURNED are one answer.
+  The persisted per-host counter is the real backup, not the scan.
+
 Pure functions: VerifyNoteSignature, GenerateNoteSecret, HashK1, IsPreimage,
 ResolveNoteInput, ResolveMintInput, ResolveLnurlInput, IsAllowedServiceURL,
 BuildNoteURL, WithNewK1, WithoutK1, NoteK1, NoteDeclaredAmountMsat,

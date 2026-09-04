@@ -88,6 +88,43 @@ func BuildNoteURL(withdrawLink, k1 string, amountMsat int64) string {
 	return parsed.String()
 }
 
+// BuildNoteInfoURLByHash builds the informational GET for a note named by its
+// HASH rather than its secret.
+//
+// LUD-25's "Checking a note without exposing it": a service MAY accept
+// ?h=<hex sha256 of k1> in place of ?k1=, on the informational GET only and
+// never at the callback. It already stores every note under that hash, so this
+// is a second way into a lookup it can do anyway - and the secret stays off
+// the wire, which is what a restore walk needs, since a walk queries a whole
+// gap window of indices the wallet has not minted into yet.
+//
+// k1, amount and sig are dropped: naming the note twice, once in a form that
+// spends it, would defeat the point.
+//
+// A service that does not index by hash answers exactly as it answers for an
+// unknown k1, which LUD-25 requires, so a rejection never distinguishes "not
+// supported" from "no such note" - and a burned note is deliberately
+// indistinguishable from one that never existed.
+//
+// Returns "" if the hash is not 32 bytes of hex, or the link does not parse.
+func BuildNoteInfoURLByHash(withdrawLink, h string) string {
+	hash := strings.ToLower(strings.TrimSpace(h))
+	if len(hash) != 64 || !IsPreimage(hash) {
+		return ""
+	}
+	parsed, err := url.Parse(FromLud17(strings.TrimSpace(withdrawLink)))
+	if err != nil {
+		return ""
+	}
+	query := parsed.Query()
+	query.Del("k1")
+	query.Del("amount")
+	query.Del("sig")
+	ordered := encodeOrdered(query, [][2]string{{"h", hash}}, 0, "")
+	parsed.RawQuery = ordered
+	return parsed.String()
+}
+
 // WithNewK1 returns the same note with its secret swapped out, after a rotate,
 // split or merge.
 //
