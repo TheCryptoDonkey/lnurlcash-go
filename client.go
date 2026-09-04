@@ -434,6 +434,14 @@ type SettledNote struct {
 // informational GET - and a fee-charging service may have deducted from a
 // split's change or refunded into a merge's result. That GET puts k1 on the
 // wire, so a rotate follows, best-effort.
+//
+// "Best-effort" covers a rotate the service definitively refused on policy
+// grounds: nothing was burned, so the exposed k1 and its signature are still
+// the note. It cannot cover a rotate that MAY HAVE APPLIED. This used to
+// discard the error entirely and return nil, so a caller could not even ask:
+// when the request had landed, that k1 was burned and the fresh secret
+// carried on the error was the only copy of the note the service had just
+// minted.
 func (c *Client) SettleNote(ctx context.Context, baseURL, k1 string, expectedAmountMsat int64, signature string) (SettledNote, error) {
 	noteURL := WithNewK1(baseURL, k1, expectedAmountMsat, signature)
 	if noteURL == "" {
@@ -445,6 +453,15 @@ func (c *Client) SettleNote(ctx context.Context, baseURL, k1 string, expectedAmo
 	}
 	rotated, err := c.RotateNote(ctx, info.Callback, k1)
 	if err != nil {
+		// NewSecrets is non-empty for exactly the errors that could be
+		// describing a mutation the service applied - ambiguous, unverifiable,
+		// or a spent/unknown refusal, which is also what an already-applied
+		// mutation looks like asked a second time - and empty for a refusal
+		// that burned nothing. Only the latter may be reported as a settled
+		// note.
+		if IsAmbiguous(err) || len(NewSecrets(err)) > 0 {
+			return SettledNote{}, err
+		}
 		return SettledNote{
 			K1:         k1,
 			AmountMsat: info.MaxWithdrawableMsat,

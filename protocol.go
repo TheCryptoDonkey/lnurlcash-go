@@ -310,6 +310,60 @@ func ParseNoteInfo(body []byte, queriedURL string, policy Policy) (WithdrawInfo,
 	}, nil
 }
 
+// ParseNoteInfoByHash reads the same response, for a lookup that named the
+// note by its hash.
+//
+// Differs from ParseNoteInfo in exactly two places, both because there was no
+// secret in the request: k1 is not required in the response, and there is no
+// echo to check against. Everything else - the shape, and the mandatory
+// mintPubkey - is enforced identically, because a note nobody can verify
+// offline is no more acceptable when it was looked up privately.
+//
+// K1 on the returned value is empty: a conforming service has nothing to echo
+// when the request never named a secret, and the caller already holds it.
+func ParseNoteInfoByHash(body []byte, policy Policy) (WithdrawInfo, error) {
+	parsed, err := decode(body)
+	if err != nil {
+		return WithdrawInfo{}, err
+	}
+	if err := rejectError(parsed); err != nil {
+		var service *ServiceError
+		_ = asService(err, &service)
+		return WithdrawInfo{}, classifyNoteError(service.Reason)
+	}
+	invalid := &ProtocolError{Detail: "not a withdrawRequest (unexpected response)"}
+	if str(parsed, "tag") != "withdrawRequest" {
+		return WithdrawInfo{}, invalid
+	}
+	callback := str(parsed, "callback")
+	maximum, ok := msat(parsed, "maxWithdrawable")
+	if callback == "" || !ok || maximum < 0 {
+		return WithdrawInfo{}, invalid
+	}
+	minimum := int64(0)
+	if _, present := parsed["minWithdrawable"]; present && parsed["minWithdrawable"] != nil {
+		minimum, ok = msat(parsed, "minWithdrawable")
+		if !ok || minimum < 0 || minimum > maximum {
+			return WithdrawInfo{}, invalid
+		}
+	}
+	mintPubkey := str(parsed, "mintPubkey")
+	if policy.RequireSignatures() && !IsCompressedPubkey(mintPubkey) {
+		detail := "this service published a mintPubkey that is not a 33-byte compressed secp256k1 key"
+		if mintPubkey == "" {
+			detail = "this service publishes no mintPubkey, so its notes cannot be verified offline (LUD-25 requires one)"
+		}
+		return WithdrawInfo{}, &ProtocolError{Detail: detail}
+	}
+	return WithdrawInfo{
+		Callback:            callback,
+		MaxWithdrawableMsat: maximum,
+		MinWithdrawableMsat: minimum,
+		DefaultDescription:  str(parsed, "defaultDescription"),
+		MintPubkey:          strings.ToLower(strings.TrimSpace(mintPubkey)),
+	}, nil
+}
+
 // MintAddressRequest builds the experimental mint-address GET. Best-effort
 // discovery: most services will not have it, and a rejection means "no extra
 // information", not a failure.
