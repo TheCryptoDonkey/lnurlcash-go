@@ -818,3 +818,35 @@ func TestALyingServiceCannotInflatePastWhatItSigned(t *testing.T) {
 		t.Fatal("the true amount did not verify")
 	}
 }
+
+// A rotate whose answer never arrives must not be reported as a settled
+// note. If the request landed, the service burned that k1 and minted the
+// rotated note under h, and the fresh secret carried on the error is the
+// only copy of it. This used to discard the error and return the burned k1
+// with a nil error, so a caller could not even ask.
+func TestSettleSurfacesARotateThatMayHaveApplied(t *testing.T) {
+	mint := startMint(t, "--dropAfterMutation=true")
+	// Retrying off, so the ambiguity survives to the caller. With the default
+	// one retry the service replays the original success per LUD-25's
+	// "Retrying a mutation" and this resolves cleanly - which is the point of
+	// that rule, and is covered by the settle test above.
+	client := lnurlcash.NewClient()
+	client.MutationRetries = -1
+	k1 := secret(31)
+	mint.credit(t, k1, 21000)
+
+	settled, err := client.SettleNote(ctx(t), mint.noteURL(k1), k1, 0, "")
+	if err == nil {
+		t.Fatalf("an unconfirmable rotate was reported as settled: %+v", settled)
+	}
+	if !lnurlcash.IsAmbiguous(err) {
+		t.Fatalf("want an ambiguous outcome, got %T: %v", err, err)
+	}
+	fresh := lnurlcash.NewSecrets(err)
+	if len(fresh) != 1 {
+		t.Fatalf("the fresh secret did not survive the error: %v", fresh)
+	}
+	if fresh[0] == k1 {
+		t.Fatal("the secret carried out is the one that was burned")
+	}
+}
