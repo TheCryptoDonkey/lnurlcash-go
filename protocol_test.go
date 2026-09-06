@@ -850,3 +850,102 @@ func TestSettleSurfacesARotateThatMayHaveApplied(t *testing.T) {
 		t.Fatal("the secret carried out is the one that was burned")
 	}
 }
+
+// The three fields the reference mint publishes on its discovery document.
+// Parsed straight from a body rather than through the mock mint: the mock
+// does not emit them, and what needs grading here is the mapping and what it
+// refuses, not another round trip.
+
+func mintAddressBody(t *testing.T, extra map[string]any) lnurlcash.MintAddress {
+	t.Helper()
+	body := map[string]any{
+		"tag":             "withdrawRequest",
+		"callback":        "https://mint.example/w/cb",
+		"payLink":         "https://mint.example/.well-known/lnurlp/mint",
+		"minWithdrawable": 1000,
+		"maxWithdrawable": 100_000_000,
+	}
+	for key, value := range extra {
+		body[key] = value
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	address, err := lnurlcash.ParseMintAddress(encoded)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return address
+}
+
+func TestReadsEveryAddressTheNodeAnnounces(t *testing.T) {
+	clearnet := "02aa@2.29.14.244:9735"
+	onion := "02aa@abcdefghijklmnop.onion:9735"
+	address := mintAddressBody(t, map[string]any{
+		"nodeUri":  clearnet,
+		"nodeUris": []any{clearnet, onion},
+	})
+	if len(address.NodeURIs) != 2 || address.NodeURIs[0] != clearnet || address.NodeURIs[1] != onion {
+		t.Fatalf("node uris = %v", address.NodeURIs)
+	}
+	// the singular field is unchanged and still the first address
+	if address.NodeURI != clearnet {
+		t.Fatalf("node uri = %s", address.NodeURI)
+	}
+}
+
+func TestAnAnnouncedNothingIsNilNotEmpty(t *testing.T) {
+	for name, extra := range map[string]map[string]any{
+		"absent":      {},
+		"empty":       {"nodeUris": []any{}},
+		"not a list":  {"nodeUris": "not a list"},
+		"all dropped": {"nodeUris": []any{1, "", nil}},
+	} {
+		if uris := mintAddressBody(t, extra).NodeURIs; uris != nil {
+			t.Fatalf("%s: node uris = %v, want nil", name, uris)
+		}
+	}
+	if uris := mintAddressBody(t, map[string]any{"nodeUris": []any{1, "a", "", nil}}).NodeURIs; len(uris) != 1 || uris[0] != "a" {
+		t.Fatalf("node uris = %v", uris)
+	}
+}
+
+func TestAClosingDateIsACalendarDayOrNothing(t *testing.T) {
+	for _, good := range []string{"2026-12-31", "2028-02-29"} {
+		if got := mintAddressBody(t, map[string]any{"sunsetDate": good}).SunsetDate; got != good {
+			t.Fatalf("sunset date = %q, want %q", got, good)
+		}
+	}
+	// A wallet showing a holder a closing date off an unchecked string is
+	// worse than showing nothing, so anything that is not a real day goes.
+	for _, bad := range []any{
+		"31/12/2026", "2026-12-31T09:00:00Z", "2026-02-31", "2026-02-29",
+		"2026-13-01", "2026-00-10", "2026-12-00", 20261231, nil,
+	} {
+		if got := mintAddressBody(t, map[string]any{"sunsetDate": bad}).SunsetDate; got != "" {
+			t.Fatalf("sunset date from %v = %q, want empty", bad, got)
+		}
+	}
+	if got := mintAddressBody(t, map[string]any{}).SunsetDate; got != "" {
+		t.Fatalf("sunset date = %q, want empty", got)
+	}
+}
+
+func TestWhatAMintSaysItOwesKeepsZeroDistinctFromSilence(t *testing.T) {
+	owed := mintAddressBody(t, map[string]any{"outstandingNotesMsat": 48_000}).OutstandingNotesMsat
+	if owed == nil || *owed != 48_000 {
+		t.Fatalf("outstanding = %v", owed)
+	}
+	// The whole reason this one is a pointer: zero is an answer.
+	zero := mintAddressBody(t, map[string]any{"outstandingNotesMsat": 0}).OutstandingNotesMsat
+	if zero == nil || *zero != 0 {
+		t.Fatalf("outstanding = %v, want a pointer to 0", zero)
+	}
+	if silent := mintAddressBody(t, map[string]any{}).OutstandingNotesMsat; silent != nil {
+		t.Fatalf("outstanding = %v, want nil", silent)
+	}
+	if text := mintAddressBody(t, map[string]any{"outstandingNotesMsat": "48000"}).OutstandingNotesMsat; text != nil {
+		t.Fatalf("outstanding = %v, want nil", text)
+	}
+}

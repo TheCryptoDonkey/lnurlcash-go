@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The protocol itself, with no I/O in it.
@@ -113,6 +114,24 @@ type MintAddress struct {
 	NodeCapacityMsat int64
 	NodeNumChannels  int64
 	NodeNumPeers     int64
+	// Every address the service's node announces, each already
+	// "node_key@host:port". NodeURI is the first of them; a node behind Tor
+	// as well as clearnet has more, and a caller that can only reach the
+	// other one needs the whole list. Nil, never an empty slice, when the
+	// service announces nothing.
+	NodeURIs []string
+	// The day the service plans to close, ISO-8601 ("2026-12-31"). Advance
+	// warning while there is still time to spend, deliberately not the same
+	// thing as a mint that has already stopped minting. Nothing enforces it
+	// and nothing verifies it, so it is a prompt to move notes, never a
+	// deadline to compute against. Empty when the service published none, or
+	// published something that is not a real calendar day.
+	SunsetDate string
+	// What the service says it owes, msat: every note it has issued and not
+	// burned. A pointer, unlike every other number here, because zero is a
+	// real answer - "owes nothing" and "will not say" are different things to
+	// know about a custodian, and the zero value cannot tell them apart.
+	OutstandingNotesMsat *int64
 }
 
 // PayRequest is a LUD-06 payRequest, extended per LUD-25.
@@ -215,6 +234,41 @@ func rejectError(body map[string]any) error {
 func str(body map[string]any, key string) string {
 	value, _ := body[key].(string)
 	return value
+}
+
+// Non-empty strings only, and nil rather than an empty slice for a list that
+// had none: a caller testing len() and one testing != nil have to reach the
+// same conclusion about a service that announced nothing.
+func strList(body map[string]any, key string) []string {
+	raw, ok := body[key].([]any)
+	if !ok {
+		return nil
+	}
+	var entries []string
+	for _, item := range raw {
+		if text, ok := item.(string); ok && text != "" {
+			entries = append(entries, text)
+		}
+	}
+	return entries
+}
+
+// A calendar day, YYYY-MM-DD, and nothing else. A timestamp, a
+// locale-formatted date or a typo is dropped rather than passed on, because
+// the one thing a wallet does with this is put it in front of a holder and a
+// wrong date there is worse than no date. time.Parse with a strict layout
+// rejects 2026-02-31 rather than rolling it forward to March, which is what
+// makes it the right tool here.
+func isoDate(body map[string]any, key string) string {
+	raw, ok := body[key].(string)
+	if !ok {
+		return ""
+	}
+	parsed, err := time.Parse(time.DateOnly, raw)
+	if err != nil || parsed.Format(time.DateOnly) != raw {
+		return ""
+	}
+	return raw
 }
 
 func msat(body map[string]any, key string) (int64, bool) {
@@ -392,18 +446,25 @@ func ParseMintAddress(body []byte) (MintAddress, error) {
 	capacity, _ := msat(parsed, "nodeCapacity")
 	channels, _ := msat(parsed, "nodeNumChannels")
 	peers, _ := msat(parsed, "nodeNumPeers")
+	var outstanding *int64
+	if owed, ok := msat(parsed, "outstandingNotesMsat"); ok {
+		outstanding = &owed
+	}
 	return MintAddress{
-		Callback:            str(parsed, "callback"),
-		PayLink:             str(parsed, "payLink"),
-		MaxWithdrawableMsat: maximum,
-		MinWithdrawableMsat: minimum,
-		NodePubkey:          str(parsed, "mintPubkey"),
-		NodeAlias:           str(parsed, "nodeAlias"),
-		NodeURI:             str(parsed, "nodeUri"),
-		NodeColor:           str(parsed, "nodeColor"),
-		NodeCapacityMsat:    capacity,
-		NodeNumChannels:     channels,
-		NodeNumPeers:        peers,
+		Callback:             str(parsed, "callback"),
+		PayLink:              str(parsed, "payLink"),
+		MaxWithdrawableMsat:  maximum,
+		MinWithdrawableMsat:  minimum,
+		NodePubkey:           str(parsed, "mintPubkey"),
+		NodeAlias:            str(parsed, "nodeAlias"),
+		NodeURI:              str(parsed, "nodeUri"),
+		NodeColor:            str(parsed, "nodeColor"),
+		NodeCapacityMsat:     capacity,
+		NodeNumChannels:      channels,
+		NodeNumPeers:         peers,
+		NodeURIs:             strList(parsed, "nodeUris"),
+		SunsetDate:           isoDate(parsed, "sunsetDate"),
+		OutstandingNotesMsat: outstanding,
 	}, nil
 }
 
