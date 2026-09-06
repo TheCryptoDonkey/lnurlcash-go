@@ -5,6 +5,21 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Three more fields off a mint address
+
+`ParseMintAddress` reads `nodeUris`, `sunsetDate` and `outstandingNotesMsat`,
+which the reference mint publishes and this dropped.
+
+- `NodeURIs` — every address the service's node announces. `NodeURI` is the
+  first of them; a node behind Tor as well as clearnet has more. Nil rather
+  than an empty slice when there are none.
+- `SunsetDate` — the day the service plans to close, ISO-8601. Validated as a
+  real calendar day and left empty otherwise: the one thing a wallet does with
+  this is show it to a holder, and a wrong date is worse than no date.
+- `OutstandingNotesMsat` — what the service says it owes. A `*int64`, unlike
+  every other number on this struct, because zero is a real answer and the
+  zero value cannot tell "owes nothing" from "will not say".
+
 ### Seed-recoverable note secrets, and the private lookup a restore needs
 
 - `cash.go`: LUD-25's `m/139'` scheme. `DeriveCashRoot`,
